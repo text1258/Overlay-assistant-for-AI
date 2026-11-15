@@ -32,7 +32,7 @@ from core import (
     running_pid, save_json, send_command, set_active_chat, set_dpi_aware,
     set_hotkeys_paused, take_commands, update_chat, update_state, write_pid,
     THEME_LABELS, monitor_choices, DISPLAY_MODES, ScreenMarks, pick_monitor,
-    MATH, MATH_MODES, insert_rich, math_note,
+    MATH, MATH_MODES, insert_rich, math_note, EFFORTS, LinkLogin,
 )
 
 FAM = "Segoe UI" if IS_WIN else "Helvetica"
@@ -171,15 +171,41 @@ class SettingsWindow:
         row = ttk.Frame(f)
         row.pack(anchor="w")
         self.btn_install = ttk.Button(row, text="Установить Claude Code", command=self.install)
-        self.btn_login = ttk.Button(row, text="Войти в аккаунт Claude", command=self.login)
+        self.btn_login = ttk.Button(row, text="Войти через браузер", command=self.login)
+        self.btn_link = ttk.Button(row, text="Войти по ссылке", command=self.link_login)
         self.btn_logout = ttk.Button(row, text="Выйти", command=self.logout)
         self.btn_refresh = ttk.Button(row, text="Обновить", command=self.refresh_auth)
-        for b in (self.btn_install, self.btn_login, self.btn_logout, self.btn_refresh):
+        for b in (self.btn_install, self.btn_login, self.btn_link, self.btn_logout,
+                  self.btn_refresh):
             b.pack(side="left", padx=(0, 6))
         ttk.Label(f, wraplength=640, foreground="#666", text=(
-            "Как проходит вход: откроется окно терминала и браузер с claude.ai. Войди в "
-            "аккаунт и подтверди доступ. Если браузер покажет код, скопируй его в окно "
-            "терминала и нажми Enter. Статус здесь обновится сам.")).pack(anchor="w", pady=(14, 0))
+            "«Через браузер» — откроется окно терминала и браузер с claude.ai: войди и "
+            "подтверди доступ; если браузер покажет код, вставь его в окно терминала.\n"
+            "«По ссылке» — ссылка для входа появится здесь: скопируй её и открой в любом "
+            "браузере (или на телефоне), войди, а код из браузера вставь в поле ниже. "
+            "Статус обновится сам.")).pack(anchor="w", pady=(14, 0))
+
+        lf = self.link_frame = ttk.LabelFrame(f, text="Вход по ссылке", padding=10)
+        self.link_status = tk.StringVar(value="")
+        ttk.Label(lf, textvariable=self.link_status, wraplength=620).pack(anchor="w")
+        ur = ttk.Frame(lf)
+        ur.pack(fill="x", pady=(6, 0))
+        self.link_var = tk.StringVar(value="")
+        ttk.Entry(ur, textvariable=self.link_var, state="readonly").pack(side="left", fill="x",
+                                                                         expand=True)
+        ttk.Button(ur, text="Копировать", command=self._copy_link).pack(side="left", padx=(6, 0))
+        ttk.Button(ur, text="Открыть", command=self._open_link).pack(side="left", padx=(6, 0))
+        cr = ttk.Frame(lf)
+        cr.pack(fill="x", pady=(8, 0))
+        ttk.Label(cr, text="Код из браузера:").pack(side="left")
+        self.code_var = tk.StringVar(value="")
+        ce = ttk.Entry(cr, textvariable=self.code_var, width=40)
+        ce.pack(side="left", padx=6, fill="x", expand=True)
+        ce.bind("<Return>", lambda e: self._send_code())
+        ttk.Button(cr, text="Отправить код", command=self._send_code).pack(side="left")
+        ttk.Button(lf, text="Отменить вход", command=self._cancel_link).pack(anchor="e",
+                                                                             pady=(8, 0))
+        self.link = None
 
     def _show_auth(self, exe, version, logged, desc):
         if not exe:
@@ -188,12 +214,14 @@ class SettingsWindow:
                               "Установка займёт пару минут.")
             self.btn_install.state(["!disabled"])
             self.btn_login.state(["disabled"])
+            self.btn_link.state(["disabled"])
             self.btn_logout.state(["disabled"])
             return
         self.exe_var.set(f"Claude Code {version}  ·  {exe}")
         self.auth_var.set(desc)
         self.btn_install.state(["disabled"])
         self.btn_login.state(["!disabled"])
+        self.btn_link.state(["!disabled"])
         self.btn_logout.state(["!disabled" if logged else "disabled"])
 
     def refresh_auth(self, then=None):
@@ -226,6 +254,79 @@ class SettingsWindow:
         self._login_deadline = time.time() + 600
         self.top.after(4000, self._poll_login)
 
+    def link_login(self):
+        exe = self._exe()
+        if not exe:
+            return
+        self._cancel_link(quiet=True)
+        try:
+            self.link = LinkLogin(exe)
+        except Exception as e:
+            self.auth_var.set(f"Не удалось запустить вход: {e}")
+            return
+        self.link_var.set("")
+        self.code_var.set("")
+        self.link_status.set("Получаю ссылку…")
+        self.link_frame.pack(fill="x", pady=(14, 0))
+        self._link_started = time.time()
+        self.auth_var.set("Вход по ссылке…")
+        self._login_deadline = time.time() + 900
+        self.top.after(300, self._poll_link)
+        self.top.after(4000, self._poll_login)
+
+    def _poll_link(self):
+        if not self.alive or not self.link:
+            return
+        lk = self.link
+        if lk.url and not self.link_var.get():
+            self.link_var.set(lk.url)
+            self.link_status.set("Скопируй ссылку и открой её в любом браузере, войди в аккаунт "
+                                 "Claude и подтверди доступ. Если браузер покажет код — "
+                                 "вставь его ниже.")
+        if lk.finished and not lk.url:
+            self.link_status.set("Claude Code не выдал ссылку. Попробуй «Войти через браузер».\n"
+                                 + lk.output[-400:])
+            return
+        if not lk.url and time.time() - self._link_started > 20:
+            self.link_status.set("Ссылка не появилась за 20 секунд. Попробуй «Войти через "
+                                 "браузер».\n" + lk.output[-400:])
+            return
+        if not lk.finished:
+            self.top.after(300, self._poll_link)
+
+    def _copy_link(self):
+        url = self.link_var.get()
+        if url:
+            self.top.clipboard_clear()
+            self.top.clipboard_append(url)
+            self.link_status.set("Ссылка скопирована. Открой её в браузере, войди и, если "
+                                 "появится код, вставь его ниже.")
+
+    def _open_link(self):
+        url = self.link_var.get()
+        if url:
+            import webbrowser
+            webbrowser.open(url)
+
+    def _send_code(self):
+        code = self.code_var.get().strip()
+        if not code or not self.link:
+            return
+        if self.link.send_code(code):
+            self.link_status.set("Код отправлен, проверяю вход…")
+            self.top.after(2500, self.link.press_enter)  # «Press Enter to continue»
+        else:
+            self.link_status.set("Процесс входа уже завершился. Нажми «Войти по ссылке» ещё раз.")
+
+    def _cancel_link(self, quiet=False):
+        if self.link:
+            self.link.cancel()
+            self.link = None
+        if not quiet:
+            self.link_frame.pack_forget()
+            self._login_deadline = 0
+            self.refresh_auth()
+
     def _poll_login(self):
         if not self.alive or not self._login_deadline:
             return
@@ -235,6 +336,10 @@ class SettingsWindow:
                 self._login_deadline = 0
                 self._show_auth(*res)
                 self.app.on_auth(True, res[3])
+                if self.link:
+                    self.link.press_enter()
+                    self.link = None
+                    self.link_frame.pack_forget()
             elif time.time() > self._login_deadline:
                 self._login_deadline = 0
                 self._show_auth(*res)
@@ -546,34 +651,45 @@ class SettingsWindow:
                      width=16).grid(row=0, column=1, sticky="w", padx=8)
         ttk.Label(f, text="sonnet — быстрее, opus — умнее", foreground="#777").grid(
             row=0, column=2, sticky="w")
+        ttk.Label(f, text="Усилия").grid(row=1, column=0, sticky="w", pady=4)
+        self.effort_var = tk.StringVar(value=dict(EFFORTS).get(self.cfg.get("effort", ""),
+                                                               EFFORTS[0][1]))
+        ttk.Combobox(f, textvariable=self.effort_var, values=[e[1] for e in EFFORTS],
+                     state="readonly", width=28).grid(row=1, column=1, columnspan=2, sticky="w",
+                                                      padx=8)
+        ttk.Label(f, wraplength=680, foreground="#777", text=(
+            "Чем выше усилия, тем дольше Claude думает и тем больше расходуется лимит "
+            "подписки: для сложных задач — «высокие», для быстрых ответов — «низкие». "
+            "Если модель не поддерживает уровень, берётся ближайший ниже.")).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(0, 6))
         self.side_var = tk.IntVar(value=self.cfg.get("max_image_side", 1600))
-        self._spin(f, 1, "Размер скриншота, px", self.side_var, 600, 3000, 100,
+        self._spin(f, 3, "Размер скриншота, px", self.side_var, 600, 3000, 100,
                    "по длинной стороне")
         ttk.Label(f, text="Текст к скриншоту по горячей клавише:").grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(10, 2))
+            row=4, column=0, columnspan=3, sticky="w", pady=(10, 2))
         self.prompt_txt = tk.Text(f, height=4, wrap="word", relief="solid", bd=1,
                                   font=("Segoe UI" if IS_WIN else "Helvetica", 10))
         self.prompt_txt.insert("1.0", self.cfg.get("screenshot_prompt", ""))
-        self.prompt_txt.grid(row=3, column=0, columnspan=3, sticky="ew")
+        self.prompt_txt.grid(row=5, column=0, columnspan=3, sticky="ew")
         ttk.Label(f, text="Путь к Claude Code (если не находится сам):").grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(12, 2))
+            row=6, column=0, columnspan=3, sticky="w", pady=(12, 2))
         self.path_var = tk.StringVar(value=self.cfg.get("claude_path", ""))
         prow = ttk.Frame(f)
-        prow.grid(row=5, column=0, columnspan=3, sticky="ew")
+        prow.grid(row=7, column=0, columnspan=3, sticky="ew")
         ttk.Entry(prow, textvariable=self.path_var).pack(side="left", fill="x", expand=True)
         ttk.Button(prow, text="Обзор…", command=self._browse).pack(side="left", padx=(6, 0))
         ttk.Button(f, text="Открыть постоянные инструкции (CLAUDE.md)",
                    command=lambda: open_path(WORK / "CLAUDE.md")).grid(
-            row=6, column=0, columnspan=3, sticky="w", pady=(14, 0))
+            row=8, column=0, columnspan=3, sticky="w", pady=(14, 0))
         ttk.Label(f, wraplength=640, foreground="#666", text=(
             "В CLAUDE.md — то, что Claude учитывает в каждом ответе: язык, стиль, "
             "краткость. Изменения действуют с нового диалога.")).grid(
-            row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Label(f, text="Формулы").grid(row=8, column=0, sticky="w", pady=(14, 4))
+            row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(f, text="Формулы").grid(row=10, column=0, sticky="w", pady=(14, 4))
         self.math_var = tk.StringVar(value=dict(MATH_MODES).get(self.cfg.get("math", "latex"),
                                                                 MATH_MODES[0][1]))
         ttk.Combobox(f, textvariable=self.math_var, values=[m[1] for m in MATH_MODES],
-                     state="readonly", width=26).grid(row=8, column=1, columnspan=2, sticky="w",
+                     state="readonly", width=26).grid(row=10, column=1, columnspan=2, sticky="w",
                                                       padx=8, pady=(14, 4))
         ok = MATH._load()
         ttk.Label(f, wraplength=680, foreground="#666" if ok else "#b3261e", text=(
@@ -581,7 +697,7 @@ class SettingsWindow:
             "векторы, интегралы. В пометках по экрану — простым текстом."
             if ok else "Для рисования формул нужна библиотека matplotlib — запусти install.bat "
             "ещё раз. Пока формулы показываются как текст LaTeX.")).grid(
-            row=9, column=0, columnspan=3, sticky="w")
+            row=11, column=0, columnspan=3, sticky="w")
         f.columnconfigure(2, weight=1)
 
     def _browse(self):
@@ -621,6 +737,7 @@ class SettingsWindow:
         m = self.model_var.get()
         self.cfg["model"] = "" if m == MODEL_LABEL_DEFAULT else m
         self.cfg["math"] = {v: k for k, v in MATH_MODES}.get(self.math_var.get(), "latex")
+        self.cfg["effort"] = {v: k for k, v in EFFORTS}.get(self.effort_var.get(), "")
         self.cfg["screenshot_prompt"] = (self.prompt_txt.get("1.0", "end-1c").strip()
                                          or DEFAULT_CONFIG["screenshot_prompt"])
         self.cfg["claude_path"] = self.path_var.get().strip()
@@ -640,6 +757,8 @@ class SettingsWindow:
         self._close()
 
     def _close(self):
+        if self.link:
+            self.link.cancel()
         if self._live_job:
             self.top.after_cancel(self._live_job)
         self.alive = False
@@ -1011,7 +1130,8 @@ class Manager:
         self.chat_view.see("end")
         self.status_var.set("думаю…")
         fresh = load_chat(cid) or self.chat
-        self.rid = self.runner.start(exe, content, fresh.get("session_id"), self.cfg.get("model"))
+        self.rid = self.runner.start(exe, content, fresh.get("session_id"),
+                                     self.cfg.get("model"), self.cfg.get("effort", ""))
 
     def stop(self):
         if self.busy:

@@ -47,6 +47,7 @@ OLD_STATE = APP_DIR / "state.json"  # от первой версии — пер�
 DEFAULT_CONFIG = {
     "claude_path": "",          # пусто = искать `claude` автоматически
     "model": "",                # "", "sonnet", "opus", "haiku", "fable"
+    "effort": "",               # "", low, medium, high, xhigh, max — усилия модели
     "screenshot_prompt": (
         "Это скриншот моего экрана. Помоги с тем, что на нём, "
         "учитывая всё, о чём мы договорились раньше."
@@ -488,11 +489,11 @@ class ClaudeRunner:
         self.req_id = 0
         self.cancelled = False
 
-    def start(self, exe, blocks, session_id, model):
+    def start(self, exe, blocks, session_id, model, effort=""):
         self.req_id += 1
         self.cancelled = False
         rid = self.req_id
-        threading.Thread(target=self._run, args=(rid, exe, blocks, session_id, model),
+        threading.Thread(target=self._run, args=(rid, exe, blocks, session_id, model, effort),
                          daemon=True).start()
         return rid
 
@@ -509,7 +510,7 @@ class ClaudeRunner:
             except Exception:
                 pass
 
-    def _run(self, rid, exe, blocks, session_id, model):
+    def _run(self, rid, exe, blocks, session_id, model, effort=""):
         post = lambda *ev: self.post((ev[0], rid) + ev[1:])
         args = [exe, "-p",
                 "--input-format", "stream-json",
@@ -523,6 +524,8 @@ class ClaudeRunner:
         args += ["--tools", "Read", "--allowedTools", "Read", "--disallowedTools", "mcp__*"]
 
         env = claude_env()
+        if effort:  # переменная, а не флаг: старые версии Claude Code её просто проигнорируют
+            env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
         msg = {"type": "user", "message": {"role": "user", "content": blocks},
                "parent_tool_use_id": None}
         payload = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
@@ -1005,6 +1008,9 @@ class RegionSelector:
 
 
 MODEL_LABEL_DEFAULT = "по умолчанию"
+EFFORTS = [("", "по умолчанию (как у модели)"), ("low", "низкие — быстрее всего"),
+           ("medium", "средние"), ("high", "высокие"), ("xhigh", "очень высокие"),
+           ("max", "максимальные — дольше всего")]
 MODELS = [MODEL_LABEL_DEFAULT, "sonnet", "opus", "haiku", "fable"]
 
 
@@ -1756,3 +1762,66 @@ def insert_rich(widget, text, *, fg, bg, size_pt, enabled=True, tags=()):
         else:
             widget.image_create("end", image=img, align="center", padx=1)
     widget.insert("end", clean_md(text[pos:], strip=False), tags)
+
+
+# ----------------------------------------------------------------------------
+# Вход по ссылке: `claude auth login` без терминала, ссылка и код — через окно
+# ----------------------------------------------------------------------------
+_URL_RE = re.compile(r"https://[^\s\x1b\x07\"'<>]+")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+class LinkLogin:
+    """Запускает `claude auth login`, достаёт из вывода ссылку для входа и передаёт код."""
+
+    def __init__(self, exe):
+        self.url = None
+        self.output = ""
+        self.proc = subprocess.Popen(
+            [exe, "auth", "login"], env=claude_env(), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        raw = b""
+        while True:
+            try:
+                chunk = self.proc.stdout.read1(4096)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            raw += chunk
+            text = raw.decode("utf-8", "replace")
+            if not self.url:
+                urls = [u.rstrip(".,;)]") for u in _URL_RE.findall(text)]
+                good = [u for u in urls if "oauth" in u or "authorize" in u or "login" in u]
+                if good or urls:
+                    self.url = max(good or urls, key=len)
+            self.output = _ANSI_RE.sub("", text)[-2000:]
+
+    def send_code(self, code):
+        try:
+            self.proc.stdin.write((code.strip() + "\n").encode("utf-8"))
+            self.proc.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def press_enter(self):
+        self.send_code("")
+
+    @property
+    def finished(self):
+        return self.proc.poll() is not None
+
+    def cancel(self):
+        if self.proc.poll() is None:
+            try:
+                if IS_WIN:
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(self.proc.pid)],
+                                   capture_output=True, creationflags=NO_WINDOW)
+                else:
+                    self.proc.terminate()
+            except Exception:
+                pass

@@ -218,7 +218,8 @@ class OverlayApp:
         self.panel.show()
         self.panel.set_text("")
         self.panel.set_status(f"думаю… · {chat.get('title')}")
-        self.rid = self.runner.start(exe, content, fresh.get("session_id"), self.cfg.get("model"))
+        self.rid = self.runner.start(exe, content, fresh.get("session_id"),
+                                     self.cfg.get("model"), self.cfg.get("effort", ""))
 
     # --- события ---------------------------------------------------------------
     def _poll_queue(self):
