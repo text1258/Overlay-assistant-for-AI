@@ -140,9 +140,13 @@ def find_codex(cfg_path=""):
     if p:
         return p
     home = Path.home()
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
     for cand in (Path(os.environ.get("APPDATA", "")) / "npm" / "codex.cmd",
+                 local / "Programs" / "OpenAI" / "Codex" / "bin" / "codex.exe",  # install.ps1
+                 local / "Microsoft" / "WinGet" / "Links" / "codex.exe",           # winget
                  home / ".local" / "bin" / ("codex.exe" if IS_WIN else "codex"),
-                 Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "codex" / "codex.exe"):
+                 home / ".npm-global" / "bin" / "codex",
+                 Path("/usr/local/bin/codex"), Path("/opt/homebrew/bin/codex")):
         if str(cand) not in (".", "") and cand.exists():
             return str(cand)
     return None
@@ -172,12 +176,28 @@ def codex_status(exe):
     return False, "Вход не выполнен."
 
 
+CODEX_PS1 = "irm https://chatgpt.com/codex/install.ps1 | iex"
+
+
 def codex_install_command():
+    """(команда, как ставим). Официальный install.ps1 падает во встроенном Windows PowerShell
+    5.1 (нет свойства OSArchitecture), поэтому на Windows сначала пробуем npm (он уже есть,
+    если Claude Code ставили через npm), затем PowerShell 7, затем winget."""
     if IS_WIN:
-        return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command",
-                "$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; "
-                "irm https://chatgpt.com/codex/install.ps1 | iex"]
-    return ["bash", "-c", "curl -fsSL https://chatgpt.com/codex/install.sh | sh"]
+        if shutil.which("npm"):
+            return (["cmd", "/k", "npm install -g @openai/codex@latest && echo. && "
+                     "echo Готово — это окно можно закрыть."], "npm")
+        if shutil.which("pwsh"):
+            return (["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command",
+                     CODEX_PS1], "PowerShell 7")
+        if shutil.which("winget"):
+            return (["cmd", "/k", "winget install -e --id OpenAI.Codex && echo. && "
+                     "echo Готово — это окно можно закрыть."], "winget")
+        return (["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command",
+                 CODEX_PS1], "PowerShell")
+    if shutil.which("npm"):
+        return (["bash", "-c", "npm install -g @openai/codex@latest"], "npm")
+    return (["bash", "-c", "curl -fsSL https://chatgpt.com/codex/install.sh | sh"], "install.sh")
 
 
 CODEX_EFFORT = {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "xhigh"}

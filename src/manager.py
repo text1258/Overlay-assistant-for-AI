@@ -811,13 +811,16 @@ class SettingsWindow:
         self._bg(work, done)
 
     def codex_install(self):
+        cmd, how = codex_install_command()
         try:
-            open_in_terminal(codex_install_command())
+            open_in_terminal(cmd)
         except Exception as e:
             self.cx_status.set(f"Не удалось запустить установку: {e}")
             return
-        self.cx_status.set("Идёт установка в отдельном окне… Когда закончится, здесь появятся "
-                           "кнопки входа.")
+        extra = ("" if how != "PowerShell" else " Если установка упадёт с ошибкой про "
+                 "OSArchitecture — поставь Node.js LTS с nodejs.org и нажми «Установить» ещё раз.")
+        self.cx_status.set(f"Идёт установка ({how}) в отдельном окне… Когда закончится, здесь "
+                           f"появятся кнопки входа.{extra}")
         self._cx_deadline = time.time() + 900
 
         def poll():
