@@ -15,8 +15,8 @@ from providers import (
     PROVIDER_SHORT, Runner, build_spec, explain_error, finish_chat, provider_of, provider_ready,
 )
 from core import (
-    ACTION_NAMES, CONFIG_PATH, STATE_PATH, WHO_NAMES, Overlay, PynputHotkeys,
-    RegionSelector, WinHotkeys, IS_WIN, MANAGER_TITLE, SCREEN_PROMPT, ScreenMarks,
+    ACTION_NAMES, CONFIG_PATH, STATE_PATH, WHO_NAMES, Overlay, make_hotkeys, screen_scale,
+    RegionSelector, set_screen_scale, MANAGER_TITLE, SCREEN_PROMPT, ScreenMarks,
     acquire_chat, fit_for_vision, marks_as_text, parse_marks, MATH, math_note,
     auth_status, claude_version, clear_pid, ensure_dirs, find_claude, focus_window,
     get_active_chat, grab_screen_at, hotkeys_paused, image_to_block, launch, load_chat,
@@ -55,6 +55,7 @@ class OverlayApp:
         MATH.preload()
         self.root = tk.Tk()
         self.root.withdraw()
+        set_screen_scale(self.root)
         self.root.title("Claude Overlay — оверлей")
         self.panel = Overlay(self.root, self.cfg, self.state, self._moved)
         self.marks = ScreenMarks(self.root, self.cfg)
@@ -72,7 +73,7 @@ class OverlayApp:
     def start_hotkeys(self):
         self.stop_hotkeys()
         hk = self.cfg["hotkeys"]
-        self.hotkeys = WinHotkeys(hk, self.q.put) if IS_WIN else PynputHotkeys(hk, self.q.put)
+        self.hotkeys = make_hotkeys(hk, self.q.put)
         self.hotkeys.start()
 
     def stop_hotkeys(self):
@@ -189,9 +190,10 @@ class OverlayApp:
             shown = "📷 скриншот" + (" области" if region else "")
             if self.cfg["overlay"].get("display_mode") == "screen":
                 vis, scale = fit_for_vision(img, self.cfg["max_image_side"])
-                ox, oy = img.info.get("origin", (0, 0))
-                self.mapping = {"ox": mon["left"] + ox, "oy": mon["top"] + oy,
-                                "scale": scale, "area": mon}
+                ox, oy = img.info.get("origin", (0, 0))  # в пикселях снимка
+                s = screen_scale()  # Retina: пикселей на единицу экрана
+                self.mapping = {"ox": mon["left"] + ox / s, "oy": mon["top"] + oy / s,
+                                "scale": scale * s, "area": mon}
                 text = prompt + "\n\n" + SCREEN_PROMPT.format(w=vis.width, h=vis.height)
                 content = [{"type": "text", "text": text}, image_to_block(vis, max(vis.size))]
                 shown += " · пометки на экране"

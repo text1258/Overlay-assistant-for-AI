@@ -1,0 +1,9 @@
+mss>=9
+Pillow>=10
+matplotlib>=3.6
+pypdf>=4
+# Linux (X11): горячие клавиши и пропуск кликов
+python-xlib>=0.33; sys_platform == "linux"
+# macOS: горячие клавиши, пропуск кликов, видимая область экрана
+pynput>=1.7; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=9; sys_platform == "darwin"

@@ -37,7 +37,7 @@ from core import (
     running_pid, save_json, send_command, set_active_chat, set_dpi_aware,
     set_hotkeys_paused, take_commands, update_chat, update_state, write_pid,
     THEME_LABELS, monitor_choices, DISPLAY_MODES, ScreenMarks, pick_monitor,
-    MATH, MATH_MODES, insert_rich, math_note, EFFORTS, LinkLogin, pdf_to_text,
+    MATH, MATH_MODES, insert_rich, math_note, EFFORTS, LinkLogin, pdf_to_text, set_screen_scale,
 )
 
 FAM = "Segoe UI" if IS_WIN else "Helvetica"
@@ -1071,6 +1071,7 @@ class Manager:
         MATH.preload()
         self.root = root = tk.Tk()
         root.title(MANAGER_TITLE)
+        set_screen_scale(root)
         root.geometry("980x700")
         root.minsize(720, 480)
         root.protocol("WM_DELETE_WINDOW", self.quit)

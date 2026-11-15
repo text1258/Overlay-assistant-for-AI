@@ -31,7 +31,10 @@ import mss
 from PIL import Image, ImageEnhance, ImageTk
 
 IS_WIN = sys.platform == "win32"
-APP_DIR = Path(__file__).resolve().parent
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+SRC_DIR = Path(__file__).resolve().parent      # код программы (папка src)
+APP_DIR = SRC_DIR.parent                        # главная папка: запускалки и данные
 WORK = APP_DIR / "workspace"
 FILES = WORK / "files"
 CONFIG_PATH = APP_DIR / "config.json"
@@ -209,15 +212,18 @@ def copy_unique(src: Path, folder: Path) -> Path:
 
 
 def grab_screen_at(x, y):
-    """Скриншот монитора, на котором сейчас курсор."""
+    """Скриншот монитора, на котором сейчас курсор (x, y — в единицах Tk).
+    Возвращает картинку в пикселях и монитор в единицах Tk."""
+    s = _SCALE
+    px, py = x * s, y * s
     with mss.mss() as sct:
         mons = sct.monitors[1:] or [sct.monitors[0]]
         mon = next((m for m in mons
-                    if m["left"] <= x < m["left"] + m["width"]
-                    and m["top"] <= y < m["top"] + m["height"]), mons[0])
+                    if m["left"] <= px < m["left"] + m["width"]
+                    and m["top"] <= py < m["top"] + m["height"]), mons[0])
         shot = sct.grab(mon)
         img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-    return img, dict(mon)
+    return img, _to_tk(mon)
 
 
 # ----------------------------------------------------------------------------
@@ -651,6 +657,14 @@ def system_theme():
             r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
                                capture_output=True, timeout=3)
             return "dark" if b"Dark" in r.stdout else "light"
+        if IS_LINUX and shutil.which("gsettings"):
+            r = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                               capture_output=True, timeout=3)
+            out = r.stdout.decode("utf-8", "replace")
+            if "dark" in out:
+                return "dark"
+            if "light" in out or "default" in out:
+                return "light"
     except Exception:
         pass
     return "dark"
@@ -663,11 +677,11 @@ def theme_colors(name):
 
 
 def list_monitors():
-    """Мониторы в физических пикселях: [{'left','top','width','height'}, …]."""
+    """Мониторы в единицах Tk (на Windows/Linux — пиксели): [{'left','top','width','height'}, …]."""
     try:
         with mss.mss() as sct:
-            mons = [dict(m) for m in sct.monitors[1:]]
-            return mons or [dict(sct.monitors[0])]
+            mons = [_to_tk(m) for m in sct.monitors[1:]]
+            return mons or [_to_tk(sct.monitors[0])]
     except Exception:
         return [{"left": 0, "top": 0, "width": 1920, "height": 1080}]
 
@@ -691,7 +705,11 @@ def monitor_choices():
 
 
 def work_area(mon):
-    """Часть монитора без панели задач (Windows). На других системах — весь монитор."""
+    """Часть монитора без панели задач / панелей рабочего стола / меню-бара и Дока."""
+    if IS_LINUX:
+        return _linux_workarea(mon)
+    if IS_MAC:
+        return _mac_workarea(mon)
     if not IS_WIN:
         return dict(mon)
     try:
@@ -765,6 +783,7 @@ class Overlay:
 
         w = self.win = tk.Toplevel(root)
         w.withdraw()
+        w.title(f"claude-overlay-panel-{id(w)}")  # для поиска окна на macOS
         w.overrideredirect(True)
         w.attributes("-topmost", True)
         w.attributes("-alpha", self.cfg["opacity"])
@@ -978,7 +997,9 @@ class RegionSelector:
         t.overrideredirect(True)
         t.attributes("-topmost", True)
         t.geometry(f"{mon['width']}x{mon['height']}+{mon['left']}+{mon['top']}")
-        dark = ImageEnhance.Brightness(img).enhance(0.55)
+        self.k = img.width / max(1, mon["width"])  # пикселей снимка на единицу Tk
+        shown = img if abs(self.k - 1) < 0.01 else img.resize((mon["width"], mon["height"]))
+        dark = ImageEnhance.Brightness(shown).enhance(0.55)
         self.photo = ImageTk.PhotoImage(dark)
         self.bright = img
         c = self.canvas = tk.Canvas(t, highlightthickness=0, cursor="crosshair",
@@ -1015,8 +1036,10 @@ class RegionSelector:
         if box[2] - box[0] < 8 or box[3] - box[1] < 8:
             self._close(None)
             return
+        k = self.k
+        box = tuple(int(round(v * k)) for v in box)  # в пиксели снимка
         crop = self.img.crop(box)
-        crop.info["origin"] = (box[0], box[1])  # где область лежит на мониторе
+        crop.info["origin"] = (box[0], box[1])  # где область лежит на мониторе, в пикселях
         self._close(crop)
 
     def _close(self, crop):
@@ -1401,7 +1424,7 @@ def launch(script):
         kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED | NEW_PROCESS_GROUP
     else:
         kw["start_new_session"] = True
-    return subprocess.Popen([python_gui_exe(), str(APP_DIR / script)], **kw)
+    return subprocess.Popen([python_gui_exe(), str(SRC_DIR / script)], **kw)
 
 
 def focus_window(title):
@@ -1497,7 +1520,11 @@ def marks_as_text(parsed):
 
 
 def make_click_through(win, enable=True):
-    """Окно пропускает клики мыши насквозь (Windows)."""
+    """Окно пропускает клики мыши насквозь."""
+    if IS_LINUX:
+        return _x11_click_through(win, enable)
+    if IS_MAC:
+        return _mac_click_through(win, enable)
     if not IS_WIN:
         return
     try:
@@ -1569,6 +1596,7 @@ class ScreenMarks:
     def _win(self, bg, alpha=1.0):
         t = tk.Toplevel(self.root)
         t.withdraw()
+        t.title(f"claude-overlay-mark-{id(t)}")
         t.overrideredirect(True)
         t.attributes("-topmost", True)
         if alpha < 1.0:
@@ -1798,8 +1826,12 @@ class LinkLogin:
     def __init__(self, exe):
         self.url = None
         self.output = ""
+        env = claude_env()
+        # Не открывать браузер самим: Claude Code запускает команду из BROWSER,
+        # а эта команда ничего не делает — ссылку пользователь откроет сам.
+        env["BROWSER"] = "cmd.exe /c rem" if IS_WIN else "true"
         self.proc = subprocess.Popen(
-            [exe, "auth", "login"], env=claude_env(), stdin=subprocess.PIPE,
+            [exe, "auth", "login"], env=env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         threading.Thread(target=self._read, daemon=True).start()
 
@@ -1846,3 +1878,218 @@ class LinkLogin:
                     self.proc.terminate()
             except Exception:
                 pass
+
+
+# ----------------------------------------------------------------------------
+# Особенности Linux (X11) и macOS
+# ----------------------------------------------------------------------------
+_SCALE = 1.0  # сколько пикселей снимка в одной единице Tk (на Retina-маках — 2)
+
+
+def set_screen_scale(root):
+    """На macOS Tk работает в «точках», а снимок экрана — в пикселях (Retina ×2)."""
+    global _SCALE
+    _SCALE = 1.0
+    if IS_MAC:
+        try:
+            with mss.mss() as sct:
+                px = sct.monitors[1]["width"]
+            pt = root.winfo_screenwidth()
+            if pt > 0 and px > pt:
+                _SCALE = round(px / pt, 3)
+        except Exception:
+            pass
+    return _SCALE
+
+
+def screen_scale():
+    return _SCALE
+
+
+def _to_tk(m):
+    s = _SCALE
+    return {"left": int(round(m["left"] / s)), "top": int(round(m["top"] / s)),
+            "width": int(round(m["width"] / s)), "height": int(round(m["height"] / s))}
+
+
+_xdisplay = None
+
+
+def _x11_display():
+    global _xdisplay
+    if _xdisplay is None:
+        from Xlib import display
+        _xdisplay = display.Display()
+    return _xdisplay
+
+
+def _x11_click_through(win, enable):
+    """X11: пустая «входная» форма окна — клики проходят насквозь (расширение SHAPE)."""
+    try:
+        from Xlib import X
+        from Xlib.ext import shape
+        d = _x11_display()
+        win.update_idletasks()
+        wid = int(win.wm_frame(), 16)
+        w = d.create_resource_object("window", wid)
+        if enable:
+            w.shape_rectangles(shape.SO.Set, shape.SK.Input, X.Unsorted, 0, 0, [])
+        else:
+            w.shape_mask(shape.SO.Set, shape.SK.Input, 0, 0, X.NONE)
+        d.sync()
+    except Exception:
+        pass
+
+
+def _mac_click_through(win, enable):
+    """macOS: setIgnoresMouseEvents у NSWindow (нужен pyobjc-framework-Cocoa)."""
+    try:
+        from AppKit import NSApplication
+        win.update_idletasks()
+        title = win.title()
+        for nw in NSApplication.sharedApplication().windows():
+            if str(nw.title()) == title:
+                nw.setIgnoresMouseEvents_(bool(enable))
+    except Exception:
+        pass
+
+
+def _linux_workarea(mon):
+    """Linux: часть монитора без панелей рабочего стола (_NET_WORKAREA)."""
+    try:
+        d = _x11_display()
+        root = d.screen().root
+        atom = d.intern_atom("_NET_WORKAREA")
+        prop = root.get_full_property(atom, 0)
+        if not prop or len(prop.value) < 4:
+            return dict(mon)
+        x, y, w, h = [int(v) for v in prop.value[:4]]
+        L = max(mon["left"], x)
+        T = max(mon["top"], y)
+        R = min(mon["left"] + mon["width"], x + w)
+        B = min(mon["top"] + mon["height"], y + h)
+        if R - L > 100 and B - T > 100:
+            return {"left": L, "top": T, "width": R - L, "height": B - T}
+    except Exception:
+        pass
+    return dict(mon)
+
+
+def _mac_workarea(mon):
+    """macOS: видимая часть экрана без меню-бара и Дока (NSScreen.visibleFrame)."""
+    try:
+        from AppKit import NSScreen
+        screens = NSScreen.screens()
+        main_h = screens[0].frame().size.height
+        for sc in screens:
+            fr, vf = sc.frame(), sc.visibleFrame()
+            left, top = int(fr.origin.x), int(main_h - fr.origin.y - fr.size.height)
+            if abs(left - mon["left"]) <= 2 and abs(top - mon["top"]) <= 2:
+                return {"left": int(vf.origin.x),
+                        "top": int(main_h - vf.origin.y - vf.size.height),
+                        "width": int(vf.size.width), "height": int(vf.size.height)}
+    except Exception:
+        pass
+    # без pyobjc — грубо: меню-бар сверху и Док снизу
+    if mon["top"] == 0:
+        return {"left": mon["left"], "top": 25, "width": mon["width"], "height": mon["height"] - 95}
+    return dict(mon)
+
+
+_X11_KEYSYMS = {"pageup": "Prior", "pagedown": "Next", "up": "Up", "down": "Down", "left": "Left",
+                "right": "Right", "space": "space", "enter": "Return", "tab": "Tab",
+                "esc": "Escape", "home": "Home", "end": "End", "insert": "Insert",
+                "delete": "Delete", "`": "grave", "-": "minus", "=": "equal",
+                "[": "bracketleft", "]": "bracketright", ";": "semicolon", "'": "apostrophe",
+                ",": "comma", ".": "period", "/": "slash"}
+
+
+class X11Hotkeys(threading.Thread):
+    """Linux (X11): XGrabKey по физическим клавишам — работает в любой раскладке."""
+
+    MODS = {"ctrl": 4, "control": 4, "shift": 1, "alt": 8, "win": 64}  # Control/Shift/Mod1/Mod4
+    IGNORED = (0, 2, 16, 2 | 16)  # CapsLock, NumLock — не должны мешать
+
+    def __init__(self, bindings, post):
+        super().__init__(daemon=True)
+        self.bindings, self.post = bindings, post
+        self._halt = False
+
+    def _parse(self, d, combo):
+        from Xlib import XK
+        mods, kc = 0, None
+        for part in combo.lower().replace(" ", "").split("+"):
+            if part in self.MODS:
+                mods |= self.MODS[part]
+                continue
+            name = _X11_KEYSYMS.get(part) or (part.upper() if re.fullmatch(r"f\d+", part) else part)
+            sym = XK.string_to_keysym(name)
+            kc = d.keysym_to_keycode(sym) if sym else 0
+            if not kc:
+                raise ValueError(f"не понимаю клавишу «{part}» в «{combo}»")
+        if kc is None:
+            raise ValueError(f"нет основной клавиши в «{combo}»")
+        return mods, kc
+
+    def run(self):
+        try:
+            from Xlib import X, error
+            from Xlib import display as xdisplay
+            d = xdisplay.Display()  # своё соединение: этот поток читает события
+        except Exception as e:
+            self.post(("hotkey_fail", [f"X11 недоступен ({e}). Нужен сеанс Xorg, не Wayland."]))
+            return
+        root = d.screen().root
+        table, failed = {}, []
+        for action, combo in self.bindings.items():
+            if not combo:
+                continue
+            try:
+                mods, kc = self._parse(d, combo)
+            except ValueError as e:
+                failed.append(str(e))
+                continue
+            ec = error.CatchError(error.BadAccess)
+            for extra in self.IGNORED:
+                root.grab_key(kc, mods | extra, True, X.GrabModeAsync, X.GrabModeAsync, onerror=ec)
+            d.sync()
+            if ec.get_error():
+                failed.append(f"{combo} (уже занято другой программой)")
+                continue
+            table[(kc, mods)] = action
+        if failed:
+            self.post(("hotkey_fail", failed))
+        mask = 1 | 4 | 8 | 64
+        try:
+            while not self._halt:
+                while d.pending_events():
+                    ev = d.next_event()
+                    if ev.type == X.KeyPress:
+                        a = table.get((ev.detail, ev.state & mask))
+                        if a:
+                            self.post(("hotkey", a))
+                time.sleep(0.03)
+        finally:
+            try:
+                for (kc, mods) in table:
+                    for extra in self.IGNORED:
+                        root.ungrab_key(kc, mods | extra)
+                d.sync()
+                d.close()
+            except Exception:
+                pass
+
+    def stop(self):
+        self._halt = True
+        self.join(1.5)
+
+
+def make_hotkeys(bindings, post):
+    """Глобальные горячие клавиши для текущей системы."""
+    if IS_WIN:
+        return WinHotkeys(bindings, post)
+    if IS_LINUX and os.environ.get("DISPLAY"):
+        import importlib.util
+        if importlib.util.find_spec("Xlib"):  # python-xlib
+            return X11Hotkeys(bindings, post)
+    return PynputHotkeys(bindings, post)
