@@ -57,9 +57,13 @@ DEFAULT_CONFIG = {
         "max_height": 420,
         "opacity": 0.85,
         "font_size": 11,
-        "corner": "top-right",  # top-right / top-left / bottom-right / bottom-left
-        "margin": 24,
-        "auto_hide_seconds": 0,  # 0 = не прятать автоматически
+        "theme": "dark",           # dark / light / system
+        "monitor": "cursor",       # cursor / primary / 1, 2, … (номер монитора)
+        "anchor": "top-right",     # top-left, top, top-right, left, center, right, bottom-…
+        "offset_x": 24,            # отступ от края по горизонтали, px
+        "offset_y": 24,            # отступ от края по вертикали, px
+        "respect_taskbar": True,   # не заходить на панель задач
+        "auto_hide_seconds": 0,    # 0 = не прятать автоматически
     },
     "hotkeys": {
         "shot": "ctrl+alt+s",          # скрин всего экрана → Claude
@@ -589,8 +593,133 @@ class ClaudeRunner:
 # ----------------------------------------------------------------------------
 # Панель поверх экрана
 # ----------------------------------------------------------------------------
+OVERLAY_THEMES = {
+    "dark": {"bg": "#16181d", "fg": "#ececec", "dim": "#8b8f98", "accent": "#d97757",
+             "edge": "#2c3038", "sel": "#3a3f4a"},
+    "light": {"bg": "#f8f7f4", "fg": "#1d1d1f", "dim": "#76716a", "accent": "#c15f3c",
+              "edge": "#d3cdc3", "sel": "#eadfd2"},
+}
+THEME_LABELS = [("dark", "Тёмная"), ("light", "Светлая"), ("system", "Как в системе")]
+
+ANCHORS = [  # (значение, стрелка на схеме, подпись) — по строкам сетки 3×3
+    ("top-left", "↖", "слева сверху"), ("top", "↑", "сверху по центру"),
+    ("top-right", "↗", "справа сверху"),
+    ("left", "←", "слева по центру"), ("center", "•", "по центру экрана"),
+    ("right", "→", "справа по центру"),
+    ("bottom-left", "↙", "слева снизу"), ("bottom", "↓", "снизу по центру"),
+    ("bottom-right", "↘", "справа снизу"),
+]
+
+
+def system_theme():
+    """'light' или 'dark' — тема приложений в системе."""
+    try:
+        if IS_WIN:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+                return "light" if winreg.QueryValueEx(k, "AppsUseLightTheme")[0] else "dark"
+        if sys.platform == "darwin":
+            r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                               capture_output=True, timeout=3)
+            return "dark" if b"Dark" in r.stdout else "light"
+    except Exception:
+        pass
+    return "dark"
+
+
+def theme_colors(name):
+    if name == "system":
+        name = system_theme()
+    return OVERLAY_THEMES.get(name, OVERLAY_THEMES["dark"])
+
+
+def list_monitors():
+    """Мониторы в физических пикселях: [{'left','top','width','height'}, …]."""
+    try:
+        with mss.mss() as sct:
+            mons = [dict(m) for m in sct.monitors[1:]]
+            return mons or [dict(sct.monitors[0])]
+    except Exception:
+        return [{"left": 0, "top": 0, "width": 1920, "height": 1080}]
+
+
+def primary_index(mons):
+    for i, m in enumerate(mons):
+        if m["left"] <= 0 < m["left"] + m["width"] and m["top"] <= 0 < m["top"] + m["height"]:
+            return i
+    return 0
+
+
+def monitor_choices():
+    """[(значение, подпись)] для выбора монитора в настройках."""
+    mons = list_monitors()
+    prim = primary_index(mons)
+    out = [("cursor", "Тот, где курсор"), ("primary", "Основной")]
+    for i, m in enumerate(mons):
+        extra = " (основной)" if i == prim else ""
+        out.append((str(i + 1), f"Монитор {i + 1} — {m['width']}×{m['height']}{extra}"))
+    return out
+
+
+def work_area(mon):
+    """Часть монитора без панели задач (Windows). На других системах — весь монитор."""
+    if not IS_WIN:
+        return dict(mon)
+    try:
+        from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+        u = ctypes.windll.user32
+        u.MonitorFromPoint.restype = ctypes.c_void_p
+        u.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        u.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        pt = wintypes.POINT(mon["left"] + mon["width"] // 2, mon["top"] + mon["height"] // 2)
+        hmon = u.MonitorFromPoint(pt, 2)  # MONITOR_DEFAULTTONEAREST
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if hmon and u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            r = mi.rcWork
+            return {"left": r.left, "top": r.top, "width": r.right - r.left,
+                    "height": r.bottom - r.top}
+    except Exception:
+        pass
+    return dict(mon)
+
+
+def pick_monitor(choice, pointer=None):
+    mons = list_monitors()
+    if choice == "cursor" and pointer:
+        x, y = pointer
+        for m in mons:
+            if m["left"] <= x < m["left"] + m["width"] and m["top"] <= y < m["top"] + m["height"]:
+                return m
+    if str(choice).isdigit() and 1 <= int(choice) <= len(mons):
+        return mons[int(choice) - 1]
+    return mons[primary_index(mons)]
+
+
+def anchor_position(area, w, h, anchor, ox, oy):
+    """Левый верхний угол панели w×h для привязки к области area."""
+    L, T, W, H = area["left"], area["top"], area["width"], area["height"]
+    if anchor in ("top-left", "left", "bottom-left"):
+        x = L + ox
+    elif anchor in ("top", "center", "bottom"):
+        x = L + (W - w) // 2 + ox
+    else:
+        x = L + W - w - ox
+    if anchor in ("top-left", "top", "top-right"):
+        y = T + oy
+    elif anchor in ("left", "center", "right"):
+        y = T + (H - h) // 2 + oy
+    else:
+        y = T + H - h - oy
+    return int(x), int(y)
+
+
 class Overlay:
-    BG, FG, DIM, ACCENT = "#16181d", "#ececec", "#8b8f98", "#d97757"
 
     def __init__(self, root, cfg, state, on_moved):
         self.root, self.state, self.on_moved = root, state, on_moved
@@ -604,32 +733,32 @@ class Overlay:
         self.font = tkfont.Font(family=fam, size=self.cfg["font_size"])
         self.small = tkfont.Font(family=fam, size=max(8, self.cfg["font_size"] - 2))
 
+        self._area = None
+
         w = self.win = tk.Toplevel(root)
         w.withdraw()
         w.overrideredirect(True)
         w.attributes("-topmost", True)
         w.attributes("-alpha", self.cfg["opacity"])
-        w.configure(bg=self.BG)
 
-        self.border = tk.Frame(w, bg=self.BG, padx=2, pady=2)
+        self.border = tk.Frame(w, padx=2, pady=2)
         self.border.pack(fill="both", expand=True)
-        inner = tk.Frame(self.border, bg=self.BG)
+        self.inner = inner = tk.Frame(self.border)
         inner.pack(fill="both", expand=True)
 
-        head = tk.Frame(inner, bg=self.BG)
+        head = tk.Frame(inner)
         head.pack(fill="x", padx=10, pady=(6, 0))
-        self.status = tk.Label(head, text="Claude", fg=self.ACCENT, bg=self.BG,
-                               font=self.small, anchor="w")
+        self.status = tk.Label(head, text="Claude", font=self.small, anchor="w")
         self.status.pack(side="left")
-        self.hint = tk.Label(head, text="", fg=self.DIM, bg=self.BG, font=self.small, anchor="e")
+        self.hint = tk.Label(head, text="", font=self.small, anchor="e")
         self.hint.pack(side="right")
         self.head = head
 
-        self.text = tk.Text(inner, wrap="word", bg=self.BG, fg=self.FG, bd=0,
-                            highlightthickness=0, padx=10, pady=6, font=self.font,
-                            cursor="arrow", insertwidth=0)
+        self.text = tk.Text(inner, wrap="word", bd=0, highlightthickness=0, padx=10, pady=6,
+                            font=self.font, cursor="arrow", insertwidth=0)
         self.text.pack(fill="both", expand=True)
         self.text.configure(state="disabled")
+        self._apply_theme()
 
         for wd in (head, self.status, self.hint, self.text):
             wd.bind("<ButtonPress-1>", self._drag_start)
@@ -642,11 +771,27 @@ class Overlay:
         self.font.configure(size=self.cfg["font_size"])
         self.small.configure(size=max(8, self.cfg["font_size"] - 2))
         self.win.attributes("-alpha", self.cfg["opacity"])
+        self._apply_theme()
+        self._area = None
         self._schedule_fit()
+
+    def _apply_theme(self):
+        c = self.colors = theme_colors(self.cfg.get("theme", "dark"))
+        self.win.configure(bg=c["bg"])
+        self.border.configure(bg=c["accent"] if self.move_mode else c["edge"])
+        for wd in (self.inner, self.head):
+            wd.configure(bg=c["bg"])
+        self.status.configure(bg=c["bg"], fg=c["accent"])
+        self.hint.configure(bg=c["bg"], fg=c["dim"])
+        self.text.configure(bg=c["bg"], fg=c["fg"], selectbackground=c["sel"],
+                            selectforeground=c["fg"], inactiveselectbackground=c["sel"])
 
     # --- видимость -------------------------------------------------------
     def show(self):
         if not self.visible:
+            self._area = None  # монитор выбирается заново при каждом появлении
+            if self.cfg.get("theme") == "system":
+                self._apply_theme()
             self.win.deiconify()
             self.visible = True
             self.win.update_idletasks()
@@ -759,17 +904,20 @@ class Overlay:
         pos = self.state.get("overlay_pos")
         if pos:
             return int(pos[0]), int(pos[1])
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        m = self.cfg["margin"]
-        corner = self.cfg.get("corner", "top-right")
-        x = sw - w - m if "right" in corner else m
-        y = sh - h - m - 40 if "bottom" in corner else m
-        return x, y
+        if self._area is None:
+            try:
+                pointer = self.root.winfo_pointerxy()
+            except tk.TclError:
+                pointer = None
+            mon = pick_monitor(self.cfg.get("monitor", "cursor"), pointer)
+            self._area = work_area(mon) if self.cfg.get("respect_taskbar", True) else mon
+        return anchor_position(self._area, w, h, self.cfg.get("anchor", "top-right"),
+                               int(self.cfg.get("offset_x", 24)), int(self.cfg.get("offset_y", 24)))
 
     # --- перемещение -----------------------------------------------------
     def toggle_move(self):
         self.move_mode = not self.move_mode
-        self.border.configure(bg=self.ACCENT if self.move_mode else self.BG)
+        self.border.configure(bg=self.colors["accent"] if self.move_mode else self.colors["edge"])
         if self.move_mode:
             self.show()
             self.set_status("перемещение: тащи мышью, колесо — прокрутка, "
@@ -857,8 +1005,6 @@ class RegionSelector:
         (self.on_done(crop) if crop is not None else self.on_cancel())
 
 
-CORNERS = [("top-right", "справа сверху"), ("top-left", "слева сверху"),
-           ("bottom-right", "справа снизу"), ("bottom-left", "слева снизу")]
 MODEL_LABEL_DEFAULT = "по умолчанию"
 MODELS = [MODEL_LABEL_DEFAULT, "sonnet", "opus", "haiku", "fable"]
 
@@ -891,7 +1037,17 @@ def ensure_dirs():
 
 
 def load_config():
-    return deep_merge(DEFAULT_CONFIG, load_json(CONFIG_PATH, {}))
+    raw = load_json(CONFIG_PATH, {})
+    raw = raw if isinstance(raw, dict) else {}
+    ov = raw.get("overlay")
+    if isinstance(ov, dict):  # перенос настроек положения из прошлых версий
+        if "anchor" not in ov and ov.get("corner"):
+            ov["anchor"] = ov["corner"]
+        if "offset_x" not in ov and "margin" in ov:
+            ov["offset_x"] = ov["offset_y"] = ov["margin"]
+        ov.pop("corner", None)
+        ov.pop("margin", None)
+    return deep_merge(DEFAULT_CONFIG, raw)
 
 
 def now_iso():

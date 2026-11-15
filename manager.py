@@ -21,7 +21,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image
 
 from core import (
-    ACTION_NAMES, CHATS, CONFIG_PATH, CORNERS, DEFAULT_CONFIG, DEFAULT_TITLE, FILES, IMAGE_EXT,
+    ACTION_NAMES, ANCHORS, CHATS, CONFIG_PATH, DEFAULT_CONFIG, DEFAULT_TITLE, FILES, IMAGE_EXT,
     IS_WIN, MANAGER_TITLE, MODELS, MODEL_LABEL_DEFAULT, NO_WINDOW, WHO_NAMES, WORK,
     _MOD_KEYSYMS, ClaudeRunner, Overlay, acquire_chat, append_messages, auth_status,
     chat_busy_by, chats_signature, claude_env, claude_version, clean_md, clear_pid,
@@ -31,6 +31,7 @@ from core import (
     mtime, open_in_terminal, open_path, pretty_combo, release_chat, resolve_error,
     running_pid, save_json, send_command, set_active_chat, set_dpi_aware,
     set_hotkeys_paused, take_commands, update_chat, update_state, write_pid,
+    THEME_LABELS, monitor_choices,
 )
 
 FAM = "Segoe UI" if IS_WIN else "Helvetica"
@@ -43,13 +44,16 @@ class SettingsWindow:
         self.alive = True
         self.capturing = None
         self.mods = set()
+        st = load_state()  # свежая позиция панели (её могли перетащить в оверлее)
+        app.panel_state.clear()
+        app.panel_state.update(st)
         self._login_deadline = 0
         self._install_deadline = 0
         set_hotkeys_paused(True)  # оверлей отпускает клавиши, пока открыты настройки
 
         t = self.top = tk.Toplevel(app.root)
         t.title("Настройки")
-        t.geometry("700x580")
+        t.geometry("780x600")
         t.minsize(600, 500)
         t.transient(app.root)
         t.protocol("WM_DELETE_WINDOW", self.cancel)
@@ -61,7 +65,8 @@ class SettingsWindow:
         self.tabs = {}
         for key, title, build in (("account", "Аккаунт", self._tab_account),
                                   ("hotkeys", "Горячие клавиши", self._tab_hotkeys),
-                                  ("overlay", "Панель", self._tab_overlay),
+                                  ("look", "Вид панели", self._tab_look),
+                                  ("position", "Положение", self._tab_position),
                                   ("claude", "Claude", self._tab_claude)):
             f = ttk.Frame(nb, padding=14)
             nb.add(f, text=title)
@@ -73,7 +78,13 @@ class SettingsWindow:
         bar.pack(fill="x")
         ttk.Button(bar, text="Отмена", command=self.cancel).pack(side="right")
         ttk.Button(bar, text="Сохранить", command=self.save).pack(side="right", padx=6)
+        self._live_job = None
+        for v in self.ov.values():
+            v.trace_add("write", self._live)
+        for v in self.pos.values():
+            v.trace_add("write", self._pos_changed)
         self.refresh_auth()
+        self._ready = True
 
     def select(self, tab):
         self.nb.select(self.tabs.get(tab, self.tabs["account"]))
@@ -313,47 +324,129 @@ class SettingsWindow:
         if hint:
             ttk.Label(f, text=hint, foreground="#777").grid(row=row, column=2, sticky="w")
 
-    def _tab_overlay(self, f):
+    def _tab_look(self, f):
         o = self.cfg["overlay"]
         self.ov = {
+            "theme": tk.StringVar(value=dict(THEME_LABELS).get(o.get("theme"), "Тёмная")),
             "width": tk.IntVar(value=o["width"]),
             "max_height": tk.IntVar(value=o["max_height"]),
             "font_size": tk.IntVar(value=o["font_size"]),
             "opacity": tk.DoubleVar(value=o["opacity"]),
             "auto_hide_seconds": tk.IntVar(value=o["auto_hide_seconds"]),
-            "corner": tk.StringVar(value=dict(CORNERS).get(o.get("corner"), CORNERS[0][1])),
         }
-        self._spin(f, 0, "Ширина, px", self.ov["width"], 250, 1600, 10)
-        self._spin(f, 1, "Макс. высота, px", self.ov["max_height"], 100, 1400, 10)
-        self._spin(f, 2, "Размер шрифта", self.ov["font_size"], 8, 28)
-        ttk.Label(f, text="Непрозрачность").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(f, text="Тема").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Combobox(f, textvariable=self.ov["theme"], state="readonly", width=16,
+                     values=[t[1] for t in THEME_LABELS]).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(f, text="«Как в системе» — по теме Windows", foreground="#777").grid(
+            row=0, column=2, sticky="w")
+        self._spin(f, 1, "Ширина, px", self.ov["width"], 250, 1600, 10)
+        self._spin(f, 2, "Макс. высота, px", self.ov["max_height"], 100, 1400, 10)
+        self._spin(f, 3, "Размер шрифта", self.ov["font_size"], 8, 28)
+        ttk.Label(f, text="Непрозрачность").grid(row=4, column=0, sticky="w", pady=4)
         op_lbl = ttk.Label(f, text=f"{int(o['opacity'] * 100)}%")
         ttk.Scale(f, from_=0.3, to=1.0, variable=self.ov["opacity"], length=160,
                   command=lambda v: op_lbl.configure(text=f"{int(float(v) * 100)}%")).grid(
-            row=3, column=1, sticky="w", padx=8)
-        op_lbl.grid(row=3, column=2, sticky="w")
-        ttk.Label(f, text="Угол экрана").grid(row=4, column=0, sticky="w", pady=4)
-        ttk.Combobox(f, textvariable=self.ov["corner"], state="readonly", width=16,
-                     values=[c[1] for c in CORNERS]).grid(row=4, column=1, columnspan=2,
-                                                          sticky="w", padx=8)
+            row=4, column=1, sticky="w", padx=8)
+        op_lbl.grid(row=4, column=2, sticky="w")
         self._spin(f, 5, "Прятать через, сек", self.ov["auto_hide_seconds"], 0, 600, 5,
                    "0 — не прятать")
-        row = ttk.Frame(f)
-        row.grid(row=6, column=0, columnspan=3, sticky="w", pady=(14, 0))
-        ttk.Button(row, text="Предпросмотр", command=self.preview).pack(side="left")
-        ttk.Button(row, text="Вернуть панель в угол", command=self.reset_pos).pack(side="left",
-                                                                                   padx=6)
+        ttk.Button(f, text="Предпросмотр", command=self.preview).grid(
+            row=6, column=0, sticky="w", pady=(14, 0))
         ttk.Label(f, wraplength=640, foreground="#666", text=(
-            "Если панель перетаскивали, она остаётся на новом месте. Чтобы снова "
-            "привязать её к углу, нажми «Вернуть панель в угол».")).grid(
-            row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+            "Изменения сразу видны в панели предпросмотра. Запущенный оверлей "
+            "подхватит их после «Сохранить».")).grid(row=7, column=0, columnspan=3, sticky="w",
+                                                     pady=(10, 0))
 
-    def preview(self):
+    def _tab_position(self, f):
+        o = self.cfg["overlay"]
+        self.monitors = monitor_choices()
+        mon_label = dict(self.monitors).get(str(o.get("monitor", "cursor")), self.monitors[0][1])
+        self.pos = {
+            "monitor": tk.StringVar(value=mon_label),
+            "anchor": tk.StringVar(value=o.get("anchor", "top-right")),
+            "offset_x": tk.IntVar(value=o.get("offset_x", 24)),
+            "offset_y": tk.IntVar(value=o.get("offset_y", 24)),
+            "respect_taskbar": tk.BooleanVar(value=o.get("respect_taskbar", True)),
+        }
+        ttk.Label(f, text="Монитор").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Combobox(f, textvariable=self.pos["monitor"], state="readonly", width=34,
+                     values=[m[1] for m in self.monitors]).grid(row=0, column=1, columnspan=2,
+                                                               sticky="w", padx=8)
+
+        ttk.Label(f, text="Где на экране").grid(row=1, column=0, sticky="nw", pady=(10, 4))
+        screen = tk.Frame(f, bg="#9a958d", padx=3, pady=3)
+        screen.grid(row=1, column=1, sticky="w", padx=8, pady=(10, 4))
+        inner = tk.Frame(screen, bg="#e9e6e0")
+        inner.pack()
+        for i, (val, arrow, _) in enumerate(ANCHORS):
+            tk.Radiobutton(inner, text=arrow, value=val, variable=self.pos["anchor"],
+                           indicatoron=0, width=5, font=(FAM, 12), relief="flat",
+                           bg="#e9e6e0", activebackground="#f3d9cc", selectcolor="#d97757",
+                           bd=1, cursor="hand2").grid(row=i // 3, column=i % 3, padx=2, pady=2)
+        self.anchor_lbl = ttk.Label(f, text="", foreground="#555")
+        self.anchor_lbl.grid(row=1, column=2, sticky="w")
+
+        self._spin(f, 2, "Отступ по горизонтали, px", self.pos["offset_x"], -4000, 4000, 4,
+                   "от края; при центре — сдвиг вправо")
+        self._spin(f, 3, "Отступ по вертикали, px", self.pos["offset_y"], -4000, 4000, 4,
+                   "от края; при центре — сдвиг вниз")
+        cb = ttk.Checkbutton(f, text="Не заходить на панель задач",
+                             variable=self.pos["respect_taskbar"])
+        cb.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        if not IS_WIN:
+            cb.state(["disabled"])
+
+        self.drag_var = tk.StringVar(value="")
+        drow = ttk.Frame(f)
+        drow.grid(row=5, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        ttk.Label(drow, textvariable=self.drag_var, wraplength=480, foreground="#666").pack(
+            side="left")
+        self.drag_btn = ttk.Button(drow, text="Вернуть к привязке", command=self.reset_pos)
+        ttk.Button(f, text="Предпросмотр", command=self.preview).grid(
+            row=6, column=0, sticky="w", pady=(14, 0))
+        f.columnconfigure(2, weight=1)
+        self.reset_drag = False
+        self._update_drag_note()
+
+    def _update_drag_note(self):
+        a = self.pos["anchor"].get()
+        self.anchor_lbl.configure(text=dict((v, t) for v, _, t in ANCHORS).get(a, ""))
+        dragged = bool(self.app.panel_state.get("overlay_pos")) and not self.reset_drag
+        move = pretty_combo(self.cfg["hotkeys"].get("move", ""))
+        if dragged:
+            self.drag_var.set("Сейчас панель стоит там, куда её перетащили — привязка не "
+                              "действует. Выбери место выше или нажми:")
+            self.drag_btn.pack(side="left", padx=6)
+        else:
+            self.drag_var.set(f"Панель также можно перетащить мышью: {move} в оверлее."
+                              if move != "— выкл —" else "")
+            self.drag_btn.pack_forget()
+
+    def _live(self, *_):
+        """Живой предпросмотр при изменении вида или положения."""
+        if not getattr(self, "_ready", False):
+            return
+        if self._live_job:
+            self.top.after_cancel(self._live_job)
+        self._live_job = self.top.after(150, lambda: self.preview(silent=True))
+
+    def _pos_changed(self, *_):
+        if getattr(self, "_ready", False):
+            self.reset_drag = True  # выбрал место вручную — отменяем перетаскивание
+            self.app.panel_state["overlay_pos"] = None
+        self._update_drag_note()
+        self._live()
+
+    def preview(self, silent=False):
+        self._live_job = None
         err = self._collect()
         if err:
-            messagebox.showerror("Настройки", err, parent=self.top)
+            if not silent:
+                messagebox.showerror("Настройки", err, parent=self.top)
             return
         ov = self.app.preview_panel()
+        if self.reset_drag:
+            self.app.panel_state["overlay_pos"] = None
         ov.apply_config(self.cfg)
         ov.show()
         ov.set_status("предпросмотр")
@@ -361,8 +454,9 @@ class SettingsWindow:
                     "x² + 2x + 1 = (x + 1)²")
 
     def reset_pos(self):
-        update_state(overlay_pos=None)
+        self.reset_drag = True
         self.app.panel_state["overlay_pos"] = None
+        self._update_drag_note()
         self.preview()
 
     # --- вкладка «Claude» -------------------------------------------------
@@ -419,7 +513,12 @@ class SettingsWindow:
             o["font_size"] = num(self.ov["font_size"], 8, 28, "Размер шрифта")
             o["opacity"] = round(num(self.ov["opacity"], 0.3, 1.0, "Непрозрачность", float), 2)
             o["auto_hide_seconds"] = num(self.ov["auto_hide_seconds"], 0, 600, "Прятать через")
-            o["corner"] = {v: k for k, v in CORNERS}.get(self.ov["corner"].get(), "top-right")
+            o["theme"] = {v: k for k, v in THEME_LABELS}.get(self.ov["theme"].get(), "dark")
+            o["monitor"] = {v: k for k, v in self.monitors}.get(self.pos["monitor"].get(), "cursor")
+            o["anchor"] = self.pos["anchor"].get() or "top-right"
+            o["offset_x"] = num(self.pos["offset_x"], -4000, 4000, "Отступ по горизонтали")
+            o["offset_y"] = num(self.pos["offset_y"], -4000, 4000, "Отступ по вертикали")
+            o["respect_taskbar"] = bool(self.pos["respect_taskbar"].get())
             self.cfg["max_image_side"] = num(self.side_var, 600, 3000, "Размер скриншота")
         except ValueError as e:
             return str(e)
@@ -435,6 +534,8 @@ class SettingsWindow:
         if err:
             messagebox.showerror("Настройки", err, parent=self.top)
             return
+        if self.reset_drag:
+            update_state(overlay_pos=None)
         self.app.apply_settings(self.cfg)
         self._close()
 
@@ -442,6 +543,8 @@ class SettingsWindow:
         self._close()
 
     def _close(self):
+        if self._live_job:
+            self.top.after_cancel(self._live_job)
         self.alive = False
         self.capturing = None
         self.top.destroy()
@@ -948,7 +1051,6 @@ class Manager:
 
     def preview_panel(self):
         if self._preview is None:
-            self.panel_state = load_state()
             self._preview = Overlay(self.root, self.cfg, self.panel_state, lambda: None)
         return self._preview
 
