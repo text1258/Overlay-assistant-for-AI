@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Установка для Linux: виртуальное окружение .venv и зависимости
-cd "$(dirname "$0")" || exit 1
+cd "$(dirname "$0")/.." || exit 1
 PY=python3
 command -v $PY >/dev/null || { echo "Нужен Python 3.10+: sudo apt install python3"; exit 1; }
 if ! $PY -c "import tkinter" 2>/dev/null; then
@@ -15,10 +15,10 @@ if [ ! -d .venv ]; then
 fi
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r src/requirements.txt || exit 1
-chmod +x start_manager_linux.sh start_overlay_linux.sh 2>/dev/null
+chmod +x linux/*.sh 2>/dev/null
 echo
 if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
   echo "Внимание: сейчас сеанс Wayland. Глобальные горячие клавиши и скриншоты"
   echo "работают в сеансе Xorg — выбери его на экране входа (\"Ubuntu on Xorg\")."
 fi
-echo "Готово. Запускай ./start_manager_linux.sh (чаты и настройки) и ./start_overlay_linux.sh (оверлей)."
+echo "Готово. Запускай linux/start_manager.sh (чаты и настройки) и linux/start_overlay.sh (оверлей)."

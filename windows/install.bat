@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-cd /d "%~dp0"
+cd /d "%~dp0.."
 echo === Установка зависимостей ===
 where py >nul 2>nul && (set PY=py) || (set PY=python)
 %PY% -m pip install --upgrade pip
@@ -13,7 +13,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Готово. Запускай start_manager_windows.bat — чаты и настройки,
-echo а start_overlay_windows.bat — оверлей. Claude Code и вход в аккаунт
-echo можно сделать прямо в программе: Настройки - Аккаунт.
+echo Готово. Запускай windows\start_manager.bat — чаты и настройки,
+echo а windows\start_overlay.bat — оверлей. Claude Code и вход в аккаунт
+echo можно сделать прямо в программе: Настройки - Нейросети.
 pause
