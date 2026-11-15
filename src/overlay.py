@@ -66,6 +66,7 @@ class OverlayApp:
         self.paused = hotkeys_paused()
         if not self.paused:
             self.start_hotkeys()
+        self.panel.set_who(PROVIDER_SHORT[provider_of(get_active_chat(), self.cfg)])
         self._startup_check()
         self.root.after(30, self._poll_queue)
         self.root.after(400, self._poll_files)
@@ -153,6 +154,7 @@ class OverlayApp:
                 if self.cfg["hotkeys"].get(a))
             paused = "\n(горячие клавиши на паузе, пока открыты настройки)" if self.paused else ""
             who = PROVIDER_SHORT[provider_of(chat, self.cfg)]
+            self.panel.set_who(who)
             self.panel.flash(f"Оверлей запущен · чат «{chat.get('title')}» · {who}\n{hint}{paused}", 6)
 
     # --- скриншот → Claude ---------------------------------------------------
@@ -228,7 +230,8 @@ class OverlayApp:
         self.panel.cancel_hide()
         self.panel.show()
         self.panel.set_text("")
-        self.panel.set_status(f"думаю… · {chat.get('title')} · {PROVIDER_SHORT[provider]}")
+        self.panel.set_who(PROVIDER_SHORT[provider])
+        self.panel.set_status(f"думаю… · {chat.get('title')}")
         self.spec = build_spec(provider, fresh, self.cfg, content)
         self.rid = self.runner.start_spec(self.spec)
 

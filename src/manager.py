@@ -1389,7 +1389,7 @@ class Manager:
         if cid == self.chat["id"]:
             return
         if self.busy:
-            self.status_var.set("Дождись ответа Claude в текущем чате")
+            self.status_var.set(f"Дождись ответа {self._who()} в текущем чате")
             self._refresh_chat_list(force=True)
             return
         self._save_prompt()
@@ -1433,7 +1433,7 @@ class Manager:
 
     def new_chat(self):
         if self.busy:
-            self.status_var.set("Дождись ответа Claude")
+            self.status_var.set(f"Дождись ответа {self._who()}")
             return
         self._save_prompt()
         c = create_chat()
@@ -1457,7 +1457,7 @@ class Manager:
         cid = self.chat["id"]
         who = chat_busy_by(cid)
         if who or self.busy:
-            messagebox.showinfo("Удаление", "Сейчас в этом чате отвечает Claude — дождись ответа.",
+            messagebox.showinfo("Удаление", f"Сейчас в этом чате отвечает {self._who()} — дождись ответа.",
                                 parent=self.root)
             return
         if not messagebox.askyesno("Удалить чат", f"Удалить чат «{self.chat.get('title')}»?\n"
@@ -1497,9 +1497,13 @@ class Manager:
     def _sys(self, text):
         self._append("sys", text)
 
+    def _who(self):
+        """Короткое имя нейросети текущего чата: Claude, ChatGPT, Gemini…"""
+        return PROVIDER_SHORT[provider_of(self.chat, self.cfg)]
+
     # --- вложения -----------------------------------------------------------
     def _attach(self):
-        for p in filedialog.askopenfilenames(title="Файлы для Claude", parent=self.root):
+        for p in filedialog.askopenfilenames(title=f"Файлы для {self._who()}", parent=self.root):
             self.attachments.append(Path(p))
         self._refresh_att()
 
@@ -1555,7 +1559,7 @@ class Manager:
         if not text and not self.attachments:
             return
         if self.busy:
-            self.status_var.set("Claude ещё отвечает…")
+            self.status_var.set(f"{self._who()} ещё отвечает…")
             return
         self._save_prompt()
         cid = self.chat["id"]

@@ -800,7 +800,8 @@ class Overlay:
 
         head = tk.Frame(inner)
         head.pack(fill="x", padx=10, pady=(6, 0))
-        self.status = tk.Label(head, text="Claude", font=self.small, anchor="w")
+        self.who = "Claude"  # подпись: какая нейросеть отвечает
+        self.status = tk.Label(head, text=self.who, font=self.small, anchor="w")
         self.status.pack(side="left")
         self.hint = tk.Label(head, text="", font=self.small, anchor="e")
         self.hint.pack(side="right")
@@ -870,8 +871,13 @@ class Overlay:
         make_click_through(self.win, enable=not self.move_mode)
 
     # --- содержимое ------------------------------------------------------
+    def set_who(self, name):
+        if name and name != self.who:
+            self.who = name
+            self.status.configure(text=name)
+
     def set_status(self, s):
-        self.status.configure(text=f"Claude · {s}" if s else "Claude")
+        self.status.configure(text=f"{self.who} · {s}" if s else self.who)
 
     def set_text(self, s, scroll_end=False):
         self.text.configure(state="normal")
