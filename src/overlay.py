@@ -13,6 +13,7 @@ import tkinter as tk
 
 from providers import (
     PROVIDER_SHORT, Runner, build_spec, explain_error, finish_chat, provider_of, provider_ready,
+    access_mode,
 )
 from core import (
     ACTION_NAMES, CONFIG_PATH, STATE_PATH, WHO_NAMES, Overlay, make_hotkeys, screen_scale,
@@ -126,7 +127,7 @@ class OverlayApp:
         prov = provider_of(get_active_chat(), cfg)
 
         def check():
-            if prov != "claude":  # другая нейросеть — своя проверка готовности
+            if prov != "claude" or access_mode(cfg, "claude") != "subscription":
                 ok, msg = provider_ready(prov, cfg)
                 self.q.put(("auth", "other", "", ok, msg))
                 return
@@ -138,7 +139,7 @@ class OverlayApp:
         threading.Thread(target=check, daemon=True).start()
 
     def _on_auth(self, exe, logged, desc=""):
-        how = f"Открой «Управление» ({self._hk('chat')}) → ⚙ Настройки → Аккаунт."
+        how = f"Открой «Управление» ({self._hk('chat')}) → ⚙ Настройки → Нейросети → Claude."
         if exe == "other" and not logged:
             self.panel.flash(f"⚠ {desc}\n«Управление» — {self._hk('chat')}.", 15)
         elif not exe:

@@ -57,11 +57,14 @@ DEFAULT_CONFIG = {
     ),
     "max_image_side": 1600,     # px, длинная сторона скриншота
     "math": "latex",            # latex — формулы картинками, plain — простым текстом
-    "providers": {               # другие нейросети (см. providers.py); ключи — в data/secrets.json
+    "providers": {               # нейросети (см. providers.py); ключи — в data/secrets.json
         "default": "claude",
-        "codex": {"path": "", "model": ""},
-        "gemini": {"model": "gemini-flash-latest"},
-        "openrouter": {"model": "openrouter/free"},
+        "claude": {"mode": "subscription"},          # subscription / token / api
+        "codex": {"path": "", "model": "", "effort": "", "mode": "subscription",
+                  "api_model": "gpt-5-mini", "api_effort": ""},
+        "gemini": {"model": "gemini-flash-latest", "effort": ""},
+        "grok": {"model": "grok-4"},
+        "openrouter": {"model": "openrouter/free", "effort": ""},
         "ollama": {"base": "http://localhost:11434/v1", "model": "qwen2.5vl:7b"},
         "gigachat": {"model": "GigaChat-2-Max", "scope": "GIGACHAT_API_PERS", "ca_file": ""},
     },
@@ -516,11 +519,12 @@ class ClaudeRunner:
         self.req_id = 0
         self.cancelled = False
 
-    def start(self, exe, blocks, session_id, model, effort=""):
+    def start(self, exe, blocks, session_id, model, effort="", env_extra=None):
         self.req_id += 1
         self.cancelled = False
         rid = self.req_id
-        threading.Thread(target=self._run, args=(rid, exe, blocks, session_id, model, effort),
+        threading.Thread(target=self._run,
+                         args=(rid, exe, blocks, session_id, model, effort, env_extra),
                          daemon=True).start()
         return rid
 
@@ -537,7 +541,7 @@ class ClaudeRunner:
             except Exception:
                 pass
 
-    def _run(self, rid, exe, blocks, session_id, model, effort=""):
+    def _run(self, rid, exe, blocks, session_id, model, effort="", env_extra=None):
         post = lambda *ev: self.post((ev[0], rid) + ev[1:])
         args = [exe, "-p",
                 "--input-format", "stream-json",
@@ -551,6 +555,7 @@ class ClaudeRunner:
         args += ["--tools", "Read", "--allowedTools", "Read", "--disallowedTools", "mcp__*"]
 
         env = claude_env()
+        env.update(env_extra or {})  # токен подписки или API-ключ, если выбран такой способ
         if effort:  # переменная, а не флаг: старые версии Claude Code её просто проигнорируют
             env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
         msg = {"type": "user", "message": {"role": "user", "content": blocks},
@@ -1446,8 +1451,8 @@ def resolve_error(text):
     if "no conversation found" in low or ("session" in low and "not found" in low):
         return "⚠ Старая сессия Claude не найдена — чат продолжится с чистого листа. Повтори запрос.", True
     if any(k in low for k in ("login", "log in", "/login", "authenticat", "oauth", "invalid api key")):
-        return ("⚠ Не выполнен вход в аккаунт Claude. Открой «Управление» → ⚙ Настройки → "
-                "Аккаунт → «Войти в аккаунт Claude».\n\n" + t), False
+        return ("⚠ Не выполнен вход в Claude. Открой «Управление» → ⚙ Настройки → Нейросети → "
+                "Claude: войди в аккаунт или выбери токен / API-ключ.\n\n" + t), False
     if "limit" in low:
         return "⚠ Похоже, исчерпан лимит подписки на текущее окно.\n\n" + t, False
     return "⚠ " + (t or "Неизвестная ошибка"), False

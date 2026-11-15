@@ -30,18 +30,44 @@ from core import (
 )
 
 PROVIDERS = [
-    ("claude", "Claude — подписка Claude"),
-    ("codex", "ChatGPT — через Codex (бесплатно или подписка)"),
-    ("gemini", "Gemini — бесплатный API-ключ Google"),
-    ("openrouter", "OpenRouter — бесплатные модели по ключу"),
+    ("claude", "Claude (Anthropic)"),
+    ("codex", "ChatGPT (OpenAI)"),
+    ("gemini", "Gemini (Google)"),
+    ("grok", "Grok (xAI)"),
+    ("openrouter", "OpenRouter — много моделей по одному ключу"),
     ("ollama", "Ollama — локально на компьютере"),
-    ("gigachat", "GigaChat — Сбер, без VPN"),
+    ("gigachat", "GigaChat (Сбер)"),
 ]
-PROVIDER_SHORT = {"claude": "Claude", "codex": "ChatGPT", "gemini": "Gemini",
+PROVIDER_SHORT = {"claude": "Claude", "codex": "ChatGPT", "gemini": "Gemini", "grok": "Grok",
                   "openrouter": "OpenRouter", "ollama": "Ollama", "gigachat": "GigaChat"}
+
+# Способы доступа: какие есть у каждой нейросети
+ACCESS_MODES = {
+    "claude": [("subscription", "Подписка Claude — вход в аккаунт"),
+               ("token", "Подписка Claude — токен (claude setup-token)"),
+               ("api", "API-ключ Anthropic — оплата за токены")],
+    "codex": [("subscription", "Подписка ChatGPT (в т. ч. бесплатная) — через Codex"),
+              ("api", "API-ключ OpenAI — оплата за токены")],
+    "gemini": [("api", "API-ключ Google AI Studio — есть бесплатный тариф")],
+    "grok": [("api", "API-ключ xAI — оплата за токены")],
+    "openrouter": [("api", "API-ключ OpenRouter — есть бесплатные модели")],
+    "ollama": [("local", "Локально — без ключа и интернета")],
+    "gigachat": [("api", "Ключ авторизации Сбера — есть бесплатный режим")],
+}
+
+
+def access_mode(cfg, provider):
+    modes = [m for m, _ in ACCESS_MODES.get(provider, [])]
+    m = pcfg(cfg, provider).get("mode")
+    return m if m in modes else (modes[0] if modes else "")
 
 # OpenAI-совместимые API
 API_PRESETS = {
+    "openai": {"base": "https://api.openai.com/v1", "model": "gpt-5-mini",
+               "key_url": "https://platform.openai.com/api-keys", "effort": "reasoning_effort"},
+    "grok": {"base": "https://api.x.ai/v1", "model": "grok-4",
+             "key_url": "https://console.x.ai", "effort": None},
+    "anthropic": {"key_url": "https://platform.claude.com/settings/keys"},
     "gemini": {"base": "https://generativelanguage.googleapis.com/v1beta/openai",
                "model": "gemini-flash-latest", "key_url": "https://aistudio.google.com/apikey",
                "effort": "reasoning_effort"},
@@ -222,7 +248,8 @@ def _http_json(url, data=None, headers=None, timeout=60, cafile="", method=None,
 
 def explain_http_error(provider, e):
     """Понятный текст ошибки сети/API."""
-    name = PROVIDER_SHORT.get(provider, provider)
+    name = PROVIDER_SHORT.get(provider) or {"openai": "OpenAI", "anthropic": "Anthropic"}.get(
+        provider, provider)
     if isinstance(e, urllib.error.HTTPError):
         try:
             body = e.read().decode("utf-8", "replace")
@@ -301,9 +328,18 @@ def giga_upload(token, data: bytes, mime, cafile=""):
 # ----------------------------------------------------------------------------
 def provider_ready(provider, cfg):
     """(готова ли, что сделать). Без сетевых запросов, кроме проверки входа CLI."""
+    mode = access_mode(cfg, provider)
     if provider == "claude":
-        return (bool(find_claude(cfg.get("claude_path", ""))),
-                "Claude Code не найден: ⚙ Настройки → Аккаунт.")
+        if not find_claude(cfg.get("claude_path", "")):
+            return False, "Claude Code не найден: ⚙ Настройки → Нейросети → Claude → «Установить»."
+        if mode == "token" and not get_secret("claude_token"):
+            return False, "Нет токена Claude: ⚙ Настройки → Нейросети → Claude."
+        if mode == "api" and not get_secret("anthropic"):
+            return False, "Нет API-ключа Anthropic: ⚙ Настройки → Нейросети → Claude."
+        return True, ""
+    if provider == "codex" and mode == "api":
+        return (bool(get_secret("openai")),
+                "Нет API-ключа OpenAI: ⚙ Настройки → Нейросети → ChatGPT.")
     if provider == "codex":
         exe = find_codex(pcfg(cfg, "codex").get("path", ""))
         if not exe:
@@ -321,8 +357,8 @@ def provider_ready(provider, cfg):
 
 
 def list_models(provider, cfg):
-    """Список моделей с сервера (для выбора в настройках)."""
-    if provider in API_PRESETS:
+    """Список моделей с сервера (для выбора в настройках). provider может быть «openai»."""
+    if provider in API_PRESETS and "base" in API_PRESETS[provider]:
         p = API_PRESETS[provider]
         base = (pcfg(cfg, provider).get("base") or p["base"]).rstrip("/")
         hdr = {"Accept": "application/json"}
@@ -340,6 +376,11 @@ def list_models(provider, cfg):
                     continue  # для скриншотов нужны модели, которые видят картинки
                 free = mid.endswith(":free")
                 ids.append((0 if free else 1, mid))
+            elif provider == "openai":
+                if mid.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")) and not any(
+                        x in mid for x in ("audio", "realtime", "tts", "transcribe", "image",
+                                           "search", "embedding")):
+                    ids.append((0, mid))
             else:
                 ids.append((0, mid))
         ids.sort()
@@ -384,20 +425,27 @@ def build_spec(provider, chat, cfg, blocks, inline_texts=()):
     text = "\n\n".join(b["text"] for b in blocks if b.get("type") == "text")
     images = [(b["source"]["media_type"], b["source"]["data"]) for b in blocks
               if b.get("type") == "image"]
-    spec = {"provider": provider, "cfg": cfg, "effort": cfg.get("effort", ""),
+    spec = {"provider": provider, "cfg": cfg, "effort": pcfg(cfg, provider).get("effort", ""),
             "text": text, "images": images, "blocks": blocks}
     hist = (chat or {}).get("history", [])
+    mode = access_mode(cfg, provider)
+    spec["mode"] = mode
 
     if provider == "claude":
         spec["exe"] = find_claude(cfg.get("claude_path", ""))
         spec["session"] = chat.get("session_id")
         spec["model"] = cfg.get("model", "")
+        spec["effort"] = cfg.get("effort", "")
+        if mode == "token":
+            spec["env"] = {"CLAUDE_CODE_OAUTH_TOKEN": get_secret("claude_token")}
+        elif mode == "api":
+            spec["env"] = {"ANTHROPIC_API_KEY": get_secret("anthropic")}
         if not spec["session"] and hist:  # чат начинали с другой нейросетью
             spec["blocks"] = [{"type": "text", "text": "Ранее в этом чате обсуждалось:\n\n"
                                + _transcript(chat)}] + blocks
         return spec
 
-    if provider == "codex":
+    if provider == "codex" and mode != "api":
         c = pcfg(cfg, "codex")
         spec["exe"] = find_codex(c.get("path", ""))
         spec["model"] = c.get("model", "")
@@ -422,12 +470,22 @@ def build_spec(provider, chat, cfg, blocks, inline_texts=()):
                 api_hist.append({"role": "assistant", "content": m.get("text", "")})
     spec["history"] = api_hist[-API_HISTORY_LIMIT:]
     spec["system"] = _instructions()
-    if provider in API_PRESETS:
+    spec["api"] = True
+    if provider == "codex":  # ChatGPT по API-ключу OpenAI
+        p, c = API_PRESETS["openai"], pcfg(cfg, "codex")
+        spec["base"] = (c.get("api_base") or p["base"]).rstrip("/")
+        spec["model"] = c.get("api_model") or p["model"]
+        spec["key"] = get_secret("openai")
+        spec["effort"] = c.get("api_effort", "")
+        spec["effort_mode"] = p["effort"]
+    elif provider in API_PRESETS:
         p = API_PRESETS[provider]
         c = pcfg(cfg, provider)
         spec["base"] = (c.get("base") or p["base"]).rstrip("/")
         spec["model"] = c.get("model") or p["model"]
         spec["key"] = get_secret(provider)
+        spec["effort_mode"] = p.get("effort")
+        spec["no_key"] = p.get("no_key", False)
     elif provider == "gigachat":
         c = pcfg(cfg, "gigachat")
         spec["model"] = c.get("model") or GIGACHAT["model"]
@@ -452,7 +510,7 @@ def finish_chat(cid, spec, shown, text, session_id, clear_session):
                 c["session_id"] = None
             elif session_id:
                 c["session_id"] = session_id
-        elif provider == "codex":
+        elif provider == "codex" and not spec.get("api"):
             if clear_session:
                 c["codex_session"] = None
             elif session_id:
@@ -482,7 +540,7 @@ def explain_error(provider, text):
     if provider == "codex":
         if "not logged in" in low or "login" in low or "unauthorized" in low or "401" in low:
             return ("⚠ Не выполнен вход в ChatGPT: «Управление» → ⚙ Настройки → Нейросети → "
-                    "ChatGPT → «Войти».\n\n" + t), False
+                    "ChatGPT → «Войти» (или выбери способ «API-ключ OpenAI»).\n\n" + t), False
         if ("session" in low or "rollout" in low or "thread" in low) and "not found" in low:
             return "⚠ Старая сессия ChatGPT не найдена — чат продолжится заново. Повтори запрос.", True
         if "limit" in low or "usage" in low:
@@ -508,8 +566,9 @@ class Runner(ClaudeRunner):
         p = spec["provider"]
         if p == "claude":
             target, args = self._run, (rid, spec["exe"], spec["blocks"], spec.get("session"),
-                                       spec.get("model", ""), spec.get("effort", ""))
-        elif p == "codex":
+                                       spec.get("model", ""), spec.get("effort", ""),
+                                       spec.get("env"))
+        elif p == "codex" and not spec.get("api"):
             target, args = self._run_codex, (rid, spec)
         elif p == "gigachat":
             target, args = self._run_giga, (rid, spec)
@@ -664,7 +723,7 @@ class Runner(ClaudeRunner):
         body = {"model": spec["model"], "stream": True,
                 "messages": self._api_messages(spec, content)}
         eff = spec.get("effort") or ""
-        mode = API_PRESETS.get(p, {}).get("effort")
+        mode = spec.get("effort_mode")
         if eff and mode:
             level = {"xhigh": "high", "max": "high"}.get(eff, eff)
             if mode == "reasoning_effort":
@@ -674,7 +733,7 @@ class Runner(ClaudeRunner):
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if spec.get("key"):
             headers["Authorization"] = f"Bearer {spec['key']}"
-        elif not API_PRESETS.get(p, {}).get("no_key"):
+        elif not spec.get("no_key"):
             post("fail", f"⚠ Нет ключа {PROVIDER_SHORT[p]}: ⚙ Настройки → Нейросети.")
             return
         if p == "openrouter":

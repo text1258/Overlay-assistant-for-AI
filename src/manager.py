@@ -8,6 +8,7 @@
 Сам оверлей (горячие клавиши + панель) — отдельная программа overlay.py.
 """
 import json
+import webbrowser
 import queue
 import re
 import subprocess
@@ -24,6 +25,7 @@ from providers import (
     PROVIDERS, PROVIDER_SHORT, Runner, build_spec, explain_error, finish_chat, provider_of,
     API_PRESETS, GIGACHAT, GIGA_SCOPES, codex_install_command, codex_status, codex_version,
     explain_http_error, find_codex, get_secret, list_models, set_secret, test_provider,
+    ACCESS_MODES, access_mode, provider_ready,
 )
 from core import (
     ACTION_NAMES, ANCHORS, CHATS, CONFIG_PATH, DEFAULT_CONFIG, DEFAULT_TITLE, FILES, IMAGE_EXT,
@@ -41,11 +43,15 @@ from core import (
 )
 
 FAM = "Segoe UI" if IS_WIN else "Helvetica"
+EFFORTS_CODEX = [("", "по умолчанию"), ("low", "низкие"), ("medium", "средние"),
+                 ("high", "высокие"), ("xhigh", "очень высокие")]
+EFFORTS_API = [("", "по умолчанию"), ("low", "низкие"), ("medium", "средние"), ("high", "высокие")]
 
 
 class SettingsWindow:
-    def __init__(self, app, tab="account"):
+    def __init__(self, app, tab="ai", provider=None):
         self.app = app
+        self.start_provider = provider or provider_of(app.chat, app.cfg)
         self.cfg = json.loads(json.dumps(app.cfg))  # рабочая копия
         self.alive = True
         self.capturing = None
@@ -76,12 +82,11 @@ class SettingsWindow:
         nb = self.nb = ttk.Notebook(t)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
         self.tabs = {}
-        for key, title, build in (("account", "Аккаунт", self._tab_account),
+        for key, title, build in (("ai", "Нейросети", self._tab_ai),
                                   ("hotkeys", "Горячие клавиши", self._tab_hotkeys),
                                   ("look", "Вид панели", self._tab_look),
                                   ("position", "Положение", self._tab_position),
-                                  ("claude", "Claude", self._tab_claude),
-                                  ("providers", "Нейросети", self._tab_providers)):
+                                  ("general", "Общие", self._tab_general)):
             outer, inner = self._scroll_tab(nb)
             nb.add(outer, text=title)
             build(inner)
@@ -135,12 +140,16 @@ class SettingsWindow:
                                          ("<MouseWheel>", "<Button-4>", "<Button-5>")])
         return outer, inner
 
-    def select(self, tab):
-        self.nb.select(self.tabs.get(tab, self.tabs["account"]))
+    def select(self, tab, provider=None):
+        tab = {"account": "ai", "providers": "ai", "claude": "ai"}.get(tab, tab)
+        self.nb.select(self.tabs.get(tab, self.tabs["ai"]))
+        if provider and hasattr(self, "sel_prov"):
+            self.sel_prov.set(dict(PROVIDERS)[provider])
+            self._show_prov()
 
-    def lift(self, tab=None):
+    def lift(self, tab=None, provider=None):
         if tab:
-            self.select(tab)
+            self.select(tab, provider)
         self.top.deiconify()
         self.top.lift()
         self.top.focus_force()
@@ -165,9 +174,6 @@ class SettingsWindow:
 
     # --- вкладка «Аккаунт» ------------------------------------------------
     def _tab_account(self, f):
-        ttk.Label(f, wraplength=640, text=(
-            "Приложение работает через официальный Claude Code и расходует лимиты "
-            "твоей подписки Claude (Pro или Max). API-ключ не нужен.")).pack(anchor="w")
         self.exe_var = tk.StringVar(value="")
         ttk.Label(f, textvariable=self.exe_var, foreground="#555", wraplength=640).pack(
             anchor="w", pady=(12, 0))
@@ -241,6 +247,11 @@ class SettingsWindow:
 
         def done(res):
             self._show_auth(*res)
+            mode = {t: k for k, t in ACCESS_MODES["claude"]}.get(
+                self.mode_vars["claude"].get()) if "claude" in self.mode_vars else "subscription"
+            if mode != "subscription" and not res[2]:
+                self.auth_var.set("Вход в аккаунт не нужен: выбран способ «"
+                                  + ("токен подписки" if mode == "token" else "API-ключ") + "».")
             if res[2]:
                 self.app.on_auth(True, res[3])
             if then:
@@ -649,140 +660,314 @@ class SettingsWindow:
         self._update_drag_note()
         self.preview()
 
-    # --- вкладка «Нейросети» ----------------------------------------------
-    def _tab_providers(self, f):
-        import webbrowser
-        pc = self.cfg.setdefault("providers", json.loads(json.dumps(DEFAULT_CONFIG["providers"])))
+    # --- вкладка «Нейросети»: выбор нейросети и её настройки -----------------
+    def _tab_ai(self, f):
+        pc = self.cfg.setdefault("providers", {})
         for k, v in DEFAULT_CONFIG["providers"].items():
             if isinstance(v, dict):
-                pc.setdefault(k, dict(v))
-        ttk.Label(f, wraplength=680, text=(
-            "Кроме Claude можно подключить другие нейросети. Нейросеть выбирается для каждого "
-            "чата — вверху окна «Управление». Ключи хранятся только на этом компьютере "
-            "(в Windows — в зашифрованном виде).")).pack(anchor="w")
-        row = ttk.Frame(f)
-        row.pack(anchor="w", pady=(10, 4))
-        ttk.Label(row, text="Для новых чатов:").pack(side="left")
-        self.def_prov = tk.StringVar(value=dict(PROVIDERS).get(pc.get("default", "claude")))
-        ttk.Combobox(row, textvariable=self.def_prov, values=[t for _, t in PROVIDERS],
-                     state="readonly", width=46).pack(side="left", padx=8)
+                d = pc.setdefault(k, {})
+                for kk, vv in v.items():
+                    d.setdefault(kk, vv)
+            else:
+                pc.setdefault(k, v)
+        self.fields = {}      # (провайдер или "", ключ) → (переменная, словарь подписей или None)
+        self.secrets = {}     # имя секрета → переменная поля
+        self.mode_vars, self.mode_frames, self.prov_status = {}, {}, {}
 
-        # ChatGPT через Codex CLI
-        cf = ttk.LabelFrame(f, text="ChatGPT — через Codex CLI (аккаунт ChatGPT, в т. ч. бесплатный)",
-                            padding=10)
-        cf.pack(fill="x", pady=(10, 0))
+        top = ttk.Frame(f)
+        top.pack(fill="x")
+        ttk.Label(top, text="Нейросеть:", font=(FAM, 11, "bold")).pack(side="left")
+        self.sel_prov = tk.StringVar(value=dict(PROVIDERS)[self.start_provider])
+        cb = ttk.Combobox(top, textvariable=self.sel_prov, values=[t for _, t in PROVIDERS],
+                          state="readonly", width=42)
+        cb.pack(side="left", padx=8)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._show_prov())
+        self.is_default = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="по умолчанию для новых чатов", variable=self.is_default,
+                        command=self._toggle_default).pack(side="left", padx=(6, 0))
+        ttk.Label(f, wraplength=720, foreground="#666", text=(
+            "Нейросеть выбирается для каждого чата — вверху окна «Управление». Ключи и токены "
+            "хранятся только на этом компьютере (в Windows — в зашифрованном виде).")).pack(
+            anchor="w", pady=(6, 0))
+        ttk.Separator(f).pack(fill="x", pady=8)
+        self.prov_host = ttk.Frame(f)
+        self.prov_host.pack(fill="both", expand=True)
+        self.prov_frames = {}
+        build = {"claude": self._p_claude, "codex": self._p_codex, "gemini": self._p_gemini,
+                 "grok": self._p_grok, "openrouter": self._p_openrouter,
+                 "ollama": self._p_ollama, "gigachat": self._p_gigachat}
+        for prov, _ in PROVIDERS:
+            fr = ttk.Frame(self.prov_host)
+            self.prov_frames[prov] = fr
+            build[prov](fr)
+        self._show_prov()
+        self._cx_deadline = 0
+        self.codex_refresh()
+
+    def _cur_prov(self):
+        return {t: k for k, t in PROVIDERS}.get(self.sel_prov.get(), "claude")
+
+    def _show_prov(self):
+        cur = self._cur_prov()
+        for p, fr in self.prov_frames.items():
+            fr.pack_forget()
+        self.prov_frames[cur].pack(fill="both", expand=True)
+        self.is_default.set(self.cfg["providers"].get("default", "claude") == cur)
+
+    def _toggle_default(self):
+        if self.is_default.get():
+            self.cfg["providers"]["default"] = self._cur_prov()
+        elif self.cfg["providers"].get("default") == self._cur_prov():
+            self.cfg["providers"]["default"] = "claude"
+            if self._cur_prov() == "claude":
+                self.is_default.set(True)
+
+    # строительные блоки панелей
+    def _modes(self, parent, prov):
+        """Выбор способа доступа + контейнер, где показывается часть для выбранного способа."""
+        modes = ACCESS_MODES[prov]
+        cur = access_mode(self.cfg, prov)
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+        ttk.Label(row, text="Способ доступа:", width=20).pack(side="left")
+        var = tk.StringVar(value=dict(modes)[cur])
+        if len(modes) > 1:
+            cb = ttk.Combobox(row, textvariable=var, values=[t for _, t in modes],
+                              state="readonly", width=52)
+            cb.pack(side="left")
+            cb.bind("<<ComboboxSelected>>", lambda e, p=prov: self._show_mode(p))
+        else:
+            ttk.Label(row, textvariable=var).pack(side="left")
+        self.mode_vars[prov] = var
+        host = ttk.Frame(parent)
+        host.pack(fill="x", pady=(8, 0))
+        frames = {m: ttk.Frame(host) for m, _ in modes}
+        self.mode_frames[prov] = frames
+        return frames
+
+    def _show_mode(self, prov):
+        mode = {t: k for k, t in ACCESS_MODES[prov]}.get(self.mode_vars[prov].get())
+        for m, fr in self.mode_frames[prov].items():
+            fr.pack_forget()
+        self.mode_frames[prov][mode].pack(fill="x")
+
+    def _note(self, parent, text):
+        ttk.Label(parent, text=text, wraplength=700, foreground="#666").pack(anchor="w",
+                                                                              pady=(6, 0))
+
+    def _key_row(self, parent, secret, label, url=None):
+        kr = ttk.Frame(parent)
+        kr.pack(fill="x", pady=(4, 0))
+        ttk.Label(kr, text=label, width=20).pack(side="left")
+        var = tk.StringVar(value=get_secret(secret))
+        ent = ttk.Entry(kr, textvariable=var, show="•")
+        ent.pack(side="left", fill="x", expand=True)
+        ttk.Button(kr, text="👁", width=3, command=lambda: ent.configure(
+            show="" if ent.cget("show") else "•")).pack(side="left", padx=4)
+        if url:
+            ttk.Button(kr, text="Получить", command=lambda: webbrowser.open(url)).pack(side="left")
+        self.secrets[secret] = var
+        return var
+
+    def _entry_row(self, parent, prov, key, label, default=""):
+        r = ttk.Frame(parent)
+        r.pack(fill="x", pady=(4, 0))
+        ttk.Label(r, text=label, width=20).pack(side="left")
+        src = self.cfg if not prov else self.cfg["providers"][prov]
+        var = tk.StringVar(value=src.get(key) or default)
+        ttk.Entry(r, textvariable=var).pack(side="left", fill="x", expand=True)
+        self.fields[(prov, key)] = (var, None)
+        return var, r
+
+    def _model_row(self, parent, prov, key, default, list_kind, status):
+        r = ttk.Frame(parent)
+        r.pack(fill="x", pady=(4, 0))
+        ttk.Label(r, text="Модель:", width=20).pack(side="left")
+        var = tk.StringVar(value=self.cfg["providers"][prov].get(key) or default)
+        cb = ttk.Combobox(r, textvariable=var, values=[var.get()])
+        cb.pack(side="left", fill="x", expand=True)
+        ttk.Button(r, text="Список моделей", command=lambda: self.load_models(
+            list_kind, cb, status)).pack(side="left", padx=(6, 0))
+        self.fields[(prov, key)] = (var, None)
+        return var
+
+    def _choice_row(self, parent, prov, key, label, options, hint=""):
+        r = ttk.Frame(parent)
+        r.pack(fill="x", pady=(4, 0))
+        ttk.Label(r, text=label, width=20).pack(side="left")
+        src = self.cfg if not prov else self.cfg["providers"][prov]
+        labels = dict(options)
+        var = tk.StringVar(value=labels.get(src.get(key, ""), options[0][1]))
+        ttk.Combobox(r, textvariable=var, values=[t for _, t in options], state="readonly",
+                     width=30).pack(side="left")
+        if hint:
+            ttk.Label(r, text="  " + hint, foreground="#777").pack(side="left")
+        self.fields[(prov, key)] = (var, {t: k for k, t in options})
+        return var
+
+    def _test_row(self, parent, prov):
+        r = ttk.Frame(parent)
+        r.pack(fill="x", pady=(8, 0))
+        status = tk.StringVar(value="")
+        ttk.Button(r, text="Проверить", command=lambda: self.test_prov(prov, status)).pack(
+            side="left")
+        ttk.Label(r, textvariable=status, wraplength=600, foreground="#1f5fbf").pack(
+            side="left", padx=8)
+        self.prov_status[prov] = status
+        return status
+
+    # панели нейросетей
+    def _p_claude(self, f):
+        frames = self._modes(f, "claude")
+        acc = ttk.LabelFrame(f, text="Claude Code", padding=10)
+        acc.pack(fill="x", pady=(10, 0))
+        self._tab_account(acc)
+        fr = frames["subscription"]
+        self._note(fr, "Запросы идут через Claude Code и расходуют лимиты подписки Pro/Max. "
+                       "Войди в аккаунт кнопками ниже.")
+        fr = frames["token"]
+        self._key_row(fr, "claude_token", "Токен подписки:")
+        r = ttk.Frame(fr)
+        r.pack(fill="x", pady=(4, 0))
+        ttk.Button(r, text="Получить токен (claude setup-token)",
+                   command=self._claude_setup_token).pack(side="left")
+        self._note(fr, "Долгосрочный токен подписки (на год): кнопка откроет окно терминала и "
+                       "браузер; после подтверждения токен появится в окне — скопируй его в поле "
+                       "выше. Удобно, если обычный вход слетает. Нужна подписка Pro/Max.")
+        fr = frames["api"]
+        self._key_row(fr, "anthropic", "API-ключ Anthropic:", API_PRESETS["anthropic"]["key_url"])
+        self._note(fr, "Оплата по API — за каждый токен, отдельно от подписки. Claude Code "
+                       "по-прежнему нужен (он делает запросы).")
+        self._show_mode("claude")
+        com = ttk.LabelFrame(f, text="Настройки Claude", padding=10)
+        com.pack(fill="x", pady=(10, 0))
+        self.model_var = self._choice_row(com, "", "model", "Модель:",
+                                          [("", MODEL_LABEL_DEFAULT)] +
+                                          [(m, m) for m in MODELS[1:]], "sonnet — быстрее, opus — умнее")
+        self.effort_var = self._choice_row(com, "", "effort", "Усилия:", EFFORTS)
+        self.path_var, pr = self._entry_row(com, "", "claude_path", "Путь к Claude Code:")
+        ttk.Button(pr, text="Обзор…", command=self._browse).pack(side="left", padx=(6, 0))
+        self._note(com, "Чем выше усилия, тем дольше Claude думает и тем больше расход. Если "
+                        "модель не поддерживает уровень, берётся ближайший ниже.")
+        self._test_row(com, "claude")
+
+    def _claude_setup_token(self):
+        exe = self._exe()
+        if not exe:
+            self.auth_var.set("Сначала установи Claude Code.")
+            return
+        try:
+            open_in_terminal([exe, "setup-token"])
+        except Exception as e:
+            self.auth_var.set(f"Не удалось запустить: {e}")
+
+    def _p_codex(self, f):
+        frames = self._modes(f, "codex")
+        fr = frames["subscription"]
         self.cx_status = tk.StringVar(value="Проверяю…")
-        ttk.Label(cf, textvariable=self.cx_status, wraplength=660).pack(anchor="w")
-        br = ttk.Frame(cf)
+        ttk.Label(fr, textvariable=self.cx_status, wraplength=700).pack(anchor="w")
+        br = ttk.Frame(fr)
         br.pack(anchor="w", pady=6)
         self.cx_btns = {}
-        for key, text, cmd in (("install", "Установить", self.codex_install),
+        for key, text, cmd in (("install", "Установить Codex", self.codex_install),
                                ("login", "Войти через браузер", lambda: self.codex_login(False)),
                                ("device", "Войти по коду", lambda: self.codex_login(True)),
                                ("logout", "Выйти", self.codex_logout),
-                               ("refresh", "Обновить", self.codex_refresh),
-                               ("test", "Проверить", lambda: self.test_prov("codex"))):
+                               ("refresh", "Обновить", self.codex_refresh)):
             b = ttk.Button(br, text=text, command=cmd)
             b.pack(side="left", padx=(0, 6))
             self.cx_btns[key] = b
-        mr = ttk.Frame(cf)
-        mr.pack(anchor="w")
-        ttk.Label(mr, text="Модель (пусто — по умолчанию):").pack(side="left")
-        self.cx_model = tk.StringVar(value=pc["codex"].get("model", ""))
-        ttk.Entry(mr, textvariable=self.cx_model, width=26).pack(side="left", padx=6)
-        ttk.Label(cf, wraplength=660, foreground="#666", text=(
-            "«Войти по коду»: в окне терминала появятся ссылка и код — открой ссылку на любом "
-            "устройстве и введи код (сначала включи вход по коду в ChatGPT: Settings → Security). "
-            "Бесплатный план ChatGPT даёт небольшой лимит. Из России сервисы OpenAI доступны "
-            "только через VPN.")).pack(anchor="w", pady=(6, 0))
+        self._entry_row(fr, "codex", "model", "Модель (пусто — авто):")
+        self._choice_row(fr, "codex", "effort", "Усилия:", EFFORTS_CODEX)
+        self._note(fr, "Работает с бесплатным аккаунтом ChatGPT (небольшой лимит) и с Plus/Pro. "
+                       "«Войти по коду»: в окне терминала появятся ссылка и код (сначала включи "
+                       "вход по коду в ChatGPT: Settings → Security).")
+        fr = frames["api"]
+        st = tk.StringVar(value="")
+        self._key_row(fr, "openai", "API-ключ OpenAI:", API_PRESETS["openai"]["key_url"])
+        self._model_row(fr, "codex", "api_model", API_PRESETS["openai"]["model"], "openai", st)
+        self._choice_row(fr, "codex", "api_effort", "Усилия:", EFFORTS_API,
+                         "только для моделей с рассуждением")
+        ttk.Label(fr, textvariable=st, wraplength=700, foreground="#1f5fbf").pack(anchor="w")
+        self._note(fr, "Оплата по API — за токены, отдельно от подписки ChatGPT.")
+        self._show_mode("codex")
+        self._test_row(f, "codex")
+        self._note(f, "Из России сервисы OpenAI доступны только через VPN.")
 
-        # API-нейросети
-        self.api = {}
-        notes = {
-            "gemini": ("Gemini — бесплатный API-ключ Google AI Studio",
-                       "Бесплатно доступны модели Flash, но лимит запросов в день небольшой и "
-                       "меняется. Из России — через VPN."),
-            "openrouter": ("OpenRouter — бесплатные модели по одному ключу",
-                           "Бесплатные модели (с «:free» в названии) — до 50 запросов в день, после "
-                           "разовой покупки кредитов на $10 — до 1000. «Список моделей» показывает "
-                           "только модели, которые видят картинки, бесплатные — первыми."),
-            "ollama": ("Ollama — локально на компьютере, бесплатно и без интернета",
-                       "Установи Ollama и скачай модель, которая видит картинки, например: "
-                       "ollama pull qwen2.5vl:7b (или gemma3). Нужна видеокарта; качество ниже, "
-                       "чем у Claude и ChatGPT."),
-            "gigachat": ("GigaChat — Сбер, работает без VPN",
-                         "Ключ авторизации: developers.sber.ru → GigaChat API → проект → «Ключ "
-                         "авторизации». Физлицам доступен бесплатный режим с лимитом токенов. "
-                         "Если ошибка сертификата — установи «Russian Trusted Root CA» с Госуслуг "
-                         "или укажи файл сертификата."),
-        }
-        for prov in ("gemini", "openrouter", "ollama", "gigachat"):
-            title, note = notes[prov]
-            fr = ttk.LabelFrame(f, text=title, padding=10)
-            fr.pack(fill="x", pady=(10, 0))
-            v = {}
-            url = (API_PRESETS.get(prov) or GIGACHAT)["key_url"]
-            kr = ttk.Frame(fr)
-            kr.pack(fill="x")
-            if prov == "ollama":
-                ttk.Label(kr, text="Адрес сервера:", width=18).pack(side="left")
-                v["base"] = tk.StringVar(value=pc["ollama"].get("base") or API_PRESETS["ollama"]["base"])
-                ttk.Entry(kr, textvariable=v["base"]).pack(side="left", fill="x", expand=True)
-                ttk.Button(kr, text="Скачать Ollama",
-                           command=lambda u=url: webbrowser.open(u)).pack(side="left", padx=(6, 0))
-            else:
-                ttk.Label(kr, text="Ключ авторизации:" if prov == "gigachat" else "API-ключ:",
-                          width=18).pack(side="left")
-                v["key"] = tk.StringVar(value=get_secret(prov))
-                ent = ttk.Entry(kr, textvariable=v["key"], show="•")
-                ent.pack(side="left", fill="x", expand=True)
-                ttk.Button(kr, text="👁", width=3, command=lambda e=ent: e.configure(
-                    show="" if e.cget("show") else "•")).pack(side="left", padx=4)
-                ttk.Button(kr, text="Получить ключ",
-                           command=lambda u=url: webbrowser.open(u)).pack(side="left")
-            mr = ttk.Frame(fr)
-            mr.pack(fill="x", pady=(6, 0))
-            ttk.Label(mr, text="Модель:", width=18).pack(side="left")
-            v["model"] = tk.StringVar(value=pc[prov].get("model") or
-                                      (API_PRESETS.get(prov) or GIGACHAT)["model"])
-            v["cb"] = ttk.Combobox(mr, textvariable=v["model"], values=[v["model"].get()])
-            v["cb"].pack(side="left", fill="x", expand=True)
-            ttk.Button(mr, text="Список моделей",
-                       command=lambda p=prov: self.load_models(p)).pack(side="left", padx=(6, 0))
-            ttk.Button(mr, text="Проверить",
-                       command=lambda p=prov: self.test_prov(p)).pack(side="left", padx=(6, 0))
-            if prov == "gigachat":
-                gr = ttk.Frame(fr)
-                gr.pack(fill="x", pady=(6, 0))
-                ttk.Label(gr, text="Тип доступа:", width=18).pack(side="left")
-                v["scope"] = tk.StringVar(value=pc["gigachat"].get("scope", "GIGACHAT_API_PERS"))
-                ttk.Combobox(gr, textvariable=v["scope"], values=GIGA_SCOPES, state="readonly",
-                             width=22).pack(side="left")
-                ttk.Label(gr, text="  PERS — для физлиц", foreground="#777").pack(side="left")
-                cr = ttk.Frame(fr)
-                cr.pack(fill="x", pady=(6, 0))
-                ttk.Label(cr, text="Файл сертификата:", width=18).pack(side="left")
-                v["ca_file"] = tk.StringVar(value=pc["gigachat"].get("ca_file", ""))
-                ttk.Entry(cr, textvariable=v["ca_file"]).pack(side="left", fill="x", expand=True)
-                ttk.Button(cr, text="Обзор…", command=lambda var=v["ca_file"]: var.set(
-                    filedialog.askopenfilename(parent=self.top, title="Сертификат (.crt / .pem)",
-                                               filetypes=[("Сертификаты", "*.crt *.pem *.cer"),
-                                                          ("Все файлы", "*")]) or var.get())
-                ).pack(side="left", padx=(6, 0))
-            v["status"] = tk.StringVar(value="")
-            ttk.Label(fr, textvariable=v["status"], wraplength=660, foreground="#1f5fbf").pack(
-                anchor="w", pady=(4, 0))
-            ttk.Label(fr, text=note, wraplength=660, foreground="#666").pack(anchor="w", pady=(2, 0))
-            self.api[prov] = v
-        self._cx_deadline = 0
-        self.codex_refresh()
+    def _api_panel(self, f, prov, key_label, model_kind, effort=True, note=""):
+        self._modes(f, prov)
+        st = tk.StringVar(value="")
+        url = API_PRESETS[prov]["key_url"]
+        self._key_row(f, prov, key_label, url)
+        self._model_row(f, prov, "model", API_PRESETS[prov]["model"], model_kind, st)
+        if effort:
+            self._choice_row(f, prov, "effort", "Усилия:", EFFORTS_API,
+                             "если модель поддерживает рассуждения")
+        ttk.Label(f, textvariable=st, wraplength=700, foreground="#1f5fbf").pack(anchor="w")
+        self._test_row(f, prov)
+        if note:
+            self._note(f, note)
+
+    def _p_gemini(self, f):
+        self._api_panel(f, "gemini", "API-ключ:", "gemini", True,
+                        "Бесплатный ключ: Google AI Studio → Get API key. Бесплатно доступны "
+                        "модели Flash, но дневной лимит небольшой и меняется. Из России — через VPN.")
+        self._show_mode("gemini")
+
+    def _p_grok(self, f):
+        self._api_panel(f, "grok", "API-ключ xAI:", "grok", False,
+                        "Ключ: console.x.ai → API Keys. Для скриншотов выбери модель, которая видит "
+                        "картинки (в списке моделей). Вход по подписке SuperGrok через Grok Build "
+                        "пока не поддерживается. Из России — через VPN.")
+        self._show_mode("grok")
+
+    def _p_openrouter(self, f):
+        self._api_panel(f, "openrouter", "API-ключ:", "openrouter", True,
+                        "Бесплатные модели («:free») — до 50 запросов в день, после разовой "
+                        "покупки кредитов на $10 — до 1000. «Список моделей» показывает только "
+                        "модели, которые видят картинки, бесплатные — первыми.")
+        self._show_mode("openrouter")
+
+    def _p_ollama(self, f):
+        self._modes(f, "ollama")
+        st = tk.StringVar(value="")
+        _, r = self._entry_row(f, "ollama", "base", "Адрес сервера:", API_PRESETS["ollama"]["base"])
+        ttk.Button(r, text="Скачать Ollama", command=lambda: webbrowser.open(
+            API_PRESETS["ollama"]["key_url"])).pack(side="left", padx=(6, 0))
+        self._model_row(f, "ollama", "model", API_PRESETS["ollama"]["model"], "ollama", st)
+        ttk.Label(f, textvariable=st, wraplength=700, foreground="#1f5fbf").pack(anchor="w")
+        self._test_row(f, "ollama")
+        self._note(f, "Бесплатно и без интернета, нужна видеокарта. Установи Ollama и скачай "
+                      "модель, которая видит картинки: ollama pull qwen2.5vl:7b (или gemma3).")
+        self._show_mode("ollama")
+
+    def _p_gigachat(self, f):
+        self._modes(f, "gigachat")
+        st = tk.StringVar(value="")
+        self._key_row(f, "gigachat", "Ключ авторизации:", GIGACHAT["key_url"])
+        self._model_row(f, "gigachat", "model", GIGACHAT["model"], "gigachat", st)
+        self._choice_row(f, "gigachat", "scope", "Тип доступа:", [(s, s) for s in GIGA_SCOPES],
+                         "PERS — для физлиц")
+        var, r = self._entry_row(f, "gigachat", "ca_file", "Файл сертификата:")
+        ttk.Button(r, text="Обзор…", command=lambda: var.set(filedialog.askopenfilename(
+            parent=self.top, title="Сертификат (.crt / .pem)",
+            filetypes=[("Сертификаты", "*.crt *.pem *.cer"), ("Все файлы", "*")]) or var.get())
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(f, textvariable=st, wraplength=700, foreground="#1f5fbf").pack(anchor="w")
+        self._test_row(f, "gigachat")
+        self._note(f, "Работает без VPN. Ключ: developers.sber.ru → GigaChat API → проект → «Ключ "
+                      "авторизации». Физлицам доступен бесплатный режим. При ошибке сертификата — "
+                      "установи «Russian Trusted Root CA» с Госуслуг или укажи файл.")
+        self._show_mode("gigachat")
+
+    def _save_secrets(self):
+        for name, var in self.secrets.items():
+            set_secret(name, var.get())
 
     def _prov_cfg(self):
         """Рабочая копия настроек с текущими значениями полей + сохранение ключей."""
         self._collect()
-        for prov, v in self.api.items():
-            if "key" in v:
-                set_secret(prov, v["key"].get())
+        self._save_secrets()
         return self.cfg
 
     def codex_refresh(self):
@@ -869,90 +1054,64 @@ class SettingsWindow:
                                         creationflags=NO_WINDOW),
                  lambda _: self.codex_refresh())
 
-    def load_models(self, prov):
-        v = self.api[prov]
-        v["status"].set("Загружаю список моделей…")
+    def load_models(self, kind, cb, status):
+        status.set("Загружаю список моделей…")
         cfg = json.loads(json.dumps(self._prov_cfg()))
 
         def work():
             try:
-                return list_models(prov, cfg), None
+                return list_models(kind, cfg), None
             except Exception as e:
-                return [], explain_http_error(prov, e)
+                return [], explain_http_error(kind, e)
 
         def done(res):
             models, err = res
             if err:
-                v["status"].set(err)
+                status.set(err)
             elif not models:
-                v["status"].set("Список пуст." + (" Для OpenRouter показываются только модели, "
-                                                  "которые видят картинки." if prov == "openrouter" else ""))
+                status.set("Список пуст." + (" Для OpenRouter показываются только модели, "
+                                             "которые видят картинки." if kind == "openrouter" else ""))
             else:
-                v["cb"].configure(values=models)
-                v["status"].set(f"Найдено моделей: {len(models)}. Выбери в списке.")
+                cb.configure(values=models)
+                status.set(f"Найдено моделей: {len(models)}. Выбери в списке.")
         self._bg(work, done)
 
-    def test_prov(self, prov):
-        target = self.api[prov]["status"] if prov in self.api else self.cx_status
-        target.set("Отправляю проверочный запрос…")
+    def test_prov(self, prov, status):
+        status.set("Отправляю проверочный запрос…")
         cfg = json.loads(json.dumps(self._prov_cfg()))
-        self._bg(lambda: test_provider(prov, cfg), lambda res: target.set(res))
+        self._bg(lambda: test_provider(prov, cfg), lambda res: status.set(res))
 
-    # --- вкладка «Claude» -------------------------------------------------
-    def _tab_claude(self, f):
-        ttk.Label(f, text="Модель").grid(row=0, column=0, sticky="w", pady=4)
-        self.model_var = tk.StringVar(value=self.cfg.get("model") or MODEL_LABEL_DEFAULT)
-        ttk.Combobox(f, textvariable=self.model_var, values=MODELS, state="readonly",
-                     width=16).grid(row=0, column=1, sticky="w", padx=8)
-        ttk.Label(f, text="sonnet — быстрее, opus — умнее", foreground="#777").grid(
-            row=0, column=2, sticky="w")
-        ttk.Label(f, text="Усилия").grid(row=1, column=0, sticky="w", pady=4)
-        self.effort_var = tk.StringVar(value=dict(EFFORTS).get(self.cfg.get("effort", ""),
-                                                               EFFORTS[0][1]))
-        ttk.Combobox(f, textvariable=self.effort_var, values=[e[1] for e in EFFORTS],
-                     state="readonly", width=28).grid(row=1, column=1, columnspan=2, sticky="w",
-                                                      padx=8)
-        ttk.Label(f, wraplength=680, foreground="#777", text=(
-            "Чем выше усилия, тем дольше Claude думает и тем больше расходуется лимит "
-            "подписки: для сложных задач — «высокие», для быстрых ответов — «низкие». "
-            "Если модель не поддерживает уровень, берётся ближайший ниже.")).grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(0, 6))
+    # --- вкладка «Общие» ----------------------------------------------------
+    def _tab_general(self, f):
         self.side_var = tk.IntVar(value=self.cfg.get("max_image_side", 1600))
-        self._spin(f, 3, "Размер скриншота, px", self.side_var, 600, 3000, 100,
+        self._spin(f, 0, "Размер скриншота, px", self.side_var, 600, 3000, 100,
                    "по длинной стороне")
-        ttk.Label(f, text="Текст к скриншоту по горячей клавише:").grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        ttk.Label(f, text="Текст к скриншоту по горячей клавише (для всех нейросетей):").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(10, 2))
         self.prompt_txt = tk.Text(f, height=4, wrap="word", relief="solid", bd=1,
                                   font=("Segoe UI" if IS_WIN else "Helvetica", 10))
         self.prompt_txt.insert("1.0", self.cfg.get("screenshot_prompt", ""))
-        self.prompt_txt.grid(row=5, column=0, columnspan=3, sticky="ew")
-        ttk.Label(f, text="Путь к Claude Code (если не находится сам):").grid(
-            row=6, column=0, columnspan=3, sticky="w", pady=(12, 2))
-        self.path_var = tk.StringVar(value=self.cfg.get("claude_path", ""))
-        prow = ttk.Frame(f)
-        prow.grid(row=7, column=0, columnspan=3, sticky="ew")
-        ttk.Entry(prow, textvariable=self.path_var).pack(side="left", fill="x", expand=True)
-        ttk.Button(prow, text="Обзор…", command=self._browse).pack(side="left", padx=(6, 0))
+        self.prompt_txt.grid(row=2, column=0, columnspan=3, sticky="ew")
         ttk.Button(f, text="Открыть постоянные инструкции (CLAUDE.md)",
                    command=lambda: open_path(WORK / "CLAUDE.md")).grid(
-            row=8, column=0, columnspan=3, sticky="w", pady=(14, 0))
-        ttk.Label(f, wraplength=640, foreground="#666", text=(
-            "В CLAUDE.md — то, что Claude учитывает в каждом ответе: язык, стиль, "
-            "краткость. Изменения действуют с нового диалога.")).grid(
-            row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Label(f, text="Формулы").grid(row=10, column=0, sticky="w", pady=(14, 4))
+            row=3, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        ttk.Label(f, wraplength=680, foreground="#666", text=(
+            "В CLAUDE.md — то, что нейросеть учитывает в каждом ответе: язык, стиль, краткость. "
+            "Его получают все нейросети. Изменения действуют с нового диалога.")).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(f, text="Формулы").grid(row=5, column=0, sticky="w", pady=(14, 4))
         self.math_var = tk.StringVar(value=dict(MATH_MODES).get(self.cfg.get("math", "latex"),
                                                                 MATH_MODES[0][1]))
         ttk.Combobox(f, textvariable=self.math_var, values=[m[1] for m in MATH_MODES],
-                     state="readonly", width=26).grid(row=10, column=1, columnspan=2, sticky="w",
+                     state="readonly", width=26).grid(row=5, column=1, columnspan=2, sticky="w",
                                                       padx=8, pady=(14, 4))
         ok = MATH._load()
         ttk.Label(f, wraplength=680, foreground="#666" if ok else "#b3261e", text=(
             "Формулы LaTeX рисуются картинками в панели и в переписке: дроби, корни, "
             "векторы, интегралы. В пометках по экрану — простым текстом."
-            if ok else "Для рисования формул нужна библиотека matplotlib — запусти install.bat "
+            if ok else "Для рисования формул нужна библиотека matplotlib — запусти установку "
             "ещё раз. Пока формулы показываются как текст LaTeX.")).grid(
-            row=11, column=0, columnspan=3, sticky="w")
+            row=6, column=0, columnspan=3, sticky="w")
         f.columnconfigure(2, weight=1)
 
     def _browse(self):
@@ -989,23 +1148,18 @@ class SettingsWindow:
             self.cfg["max_image_side"] = num(self.side_var, 600, 3000, "Размер скриншота")
         except ValueError as e:
             return str(e)
-        m = self.model_var.get()
-        self.cfg["model"] = "" if m == MODEL_LABEL_DEFAULT else m
         self.cfg["math"] = {v: k for k, v in MATH_MODES}.get(self.math_var.get(), "latex")
-        self.cfg["effort"] = {v: k for k, v in EFFORTS}.get(self.effort_var.get(), "")
-        if hasattr(self, "api"):
-            pc = self.cfg.setdefault("providers", {})
-            pc["default"] = {t: k for k, t in PROVIDERS}.get(self.def_prov.get(), "claude")
-            pc.setdefault("codex", {})["model"] = self.cx_model.get().strip()
-            for prov, v in self.api.items():
-                d = pc.setdefault(prov, {})
-                d["model"] = v["model"].get().strip()
-                for k in ("base", "scope", "ca_file"):
-                    if k in v:
-                        d[k] = v[k].get().strip()
+        pc = self.cfg.setdefault("providers", {})
+        for (prov, key), (var, mapping) in self.fields.items():
+            val = var.get().strip()
+            if mapping is not None:
+                val = mapping.get(val, "")
+            (self.cfg if not prov else pc.setdefault(prov, {}))[key] = val
+        for prov, var in self.mode_vars.items():
+            pc.setdefault(prov, {})["mode"] = {t: k for k, t in ACCESS_MODES[prov]}.get(
+                var.get(), ACCESS_MODES[prov][0][0])
         self.cfg["screenshot_prompt"] = (self.prompt_txt.get("1.0", "end-1c").strip()
                                          or DEFAULT_CONFIG["screenshot_prompt"])
-        self.cfg["claude_path"] = self.path_var.get().strip()
         return None
 
     def save(self):
@@ -1015,9 +1169,7 @@ class SettingsWindow:
             return
         if self.reset_drag:
             update_state(overlay_pos=None)
-        for prov, v in getattr(self, "api", {}).items():
-            if "key" in v:
-                set_secret(prov, v["key"].get())
+        self._save_secrets()
         self.app.apply_settings(self.cfg)
         self._close()
 
@@ -1460,16 +1612,13 @@ class Manager:
     def _handle(self, ev):
         kind = ev[0]
         if kind == "auth":
-            _, exe, version, logged, desc = ev
-            self.status_var.set(version)
-            if not exe:
-                self._sys("⚠ Claude Code не найден. Установи его: ⚙ Настройки → Аккаунт → "
-                          "«Установить Claude Code».")
-                self.open_settings("account")
-            elif not logged:
-                self._sys("⚠ Нужно войти в аккаунт Claude: ⚙ Настройки → Аккаунт → «Войти».")
-                self.open_settings("account")
-            else:
+            _, prov, ok, desc, version = ev
+            if version:
+                self.status_var.set(version)
+            if not ok:
+                self._sys(f"⚠ {PROVIDER_SHORT[prov]}: {desc} — ⚙ Настройки → Нейросети.")
+                self.open_settings("ai", prov)
+            elif prov == "claude":
                 self.on_auth(True, desc)
             return
         if ev[1] != self.rid:
@@ -1498,8 +1647,7 @@ class Manager:
                 text, clear = explain_error(prov, text)
                 if "вход" in text:
                     self._logged_in = False
-                    tab = "account" if prov == "claude" else "providers"
-                    self.root.after(100, lambda: self.open_settings(tab))
+                    self.root.after(100, lambda: self.open_settings("ai", prov))
             self._finish(text or self.cur_text, sid or self.session_id, clear)
 
     def _render(self, final=False):
@@ -1579,11 +1727,11 @@ class Manager:
         r.focus_force()
 
     # --- настройки ------------------------------------------------------------
-    def open_settings(self, tab="account"):
+    def open_settings(self, tab="ai", provider=None):
         if self.settings and self.settings.alive:
-            self.settings.lift(tab)
+            self.settings.lift(tab, provider)
         else:
-            self.settings = SettingsWindow(self, tab)
+            self.settings = SettingsWindow(self, tab, provider)
 
     def apply_settings(self, cfg):
         self.cfg = cfg
@@ -1629,14 +1777,22 @@ class Manager:
             self.status_var.set(desc.splitlines()[0])
 
     def _check_claude(self):
-        path = self.cfg.get("claude_path", "")
+        """При запуске: готова ли нейросеть активного чата (вход, ключ, программа)."""
+        cfg = json.loads(json.dumps(self.cfg))
+        prov = provider_of(self.chat, cfg)
 
         def check():
-            exe = find_claude(path)
-            if not exe:
-                self.q.put(("auth", None, "", False, ""))
+            if prov == "claude" and access_mode(cfg, "claude") == "subscription":
+                exe = find_claude(cfg.get("claude_path", ""))
+                if not exe:
+                    self.q.put(("auth", prov, False, "Claude Code не найден — установи его.", ""))
+                    return
+                ok, desc = auth_status(exe)
+                self.q.put(("auth", prov, ok, desc if ok else "Нужно войти в аккаунт Claude.",
+                            claude_version(exe)))
                 return
-            self.q.put(("auth", exe, claude_version(exe)) + auth_status(exe))
+            ok, desc = provider_ready(prov, cfg)
+            self.q.put(("auth", prov, ok, desc, ""))
         threading.Thread(target=check, daemon=True).start()
 
     def quit(self):
