@@ -1,0 +1,8 @@
+# создаётся программой при запуске
+config.json
+state.json
+*.tmp
+workspace/
+__pycache__/
+*.pyc
+.venv/
