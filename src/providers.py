@@ -737,7 +737,7 @@ class Runner(ClaudeRunner):
             post("fail", f"⚠ Нет ключа {PROVIDER_SHORT[p]}: ⚙ Настройки → Нейросети.")
             return
         if p == "openrouter":
-            headers["X-Title"] = "Claude Overlay"
+            headers["X-Title"] = "Overlay assistant for AI"
         req = urllib.request.Request(spec["base"] + "/chat/completions",
                                      data=json.dumps(body).encode("utf-8"), headers=headers)
         post("status", "думаю…")

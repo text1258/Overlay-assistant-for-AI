@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Оверлей «Claude поверх экрана»: работает в фоне без окон.
+Оверлей «ИИ-помощника поверх экрана»: работает в фоне без окон.
 
 Горячая клавиша → скриншот экрана/области → активный чат (выбирается в «Управлении»)
 → ответ в полупрозрачной панели поверх всех окон, которая пропускает клики мыши.
@@ -57,7 +57,7 @@ class OverlayApp:
         self.root = tk.Tk()
         self.root.withdraw()
         set_screen_scale(self.root)
-        self.root.title("Claude Overlay — оверлей")
+        self.root.title("AI Overlay — оверлей")
         self.panel = Overlay(self.root, self.cfg, self.state, self._moved)
         self.marks = ScreenMarks(self.root, self.cfg)
         self.mapping = None  # куда переносить координаты пометок (режим «по экрану»)

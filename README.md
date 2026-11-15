@@ -55,7 +55,8 @@ GigaChat, OpenRouter и Ollama — **бесплатно**.
 
 ### Шаг 0. Скачай программу
 
-1. Открой страницу репозитория на GitHub.
+1. Открой страницу программы на GitHub:
+   [github.com/text1258/Overlay-assistant-for-AI](https://github.com/text1258/Overlay-assistant-for-AI).
 2. Нажми зелёную кнопку **Code** → **Download ZIP**.
 3. Распакуй архив в удобное место, например в `Документы`. Не клади программу в
    `Program Files` — там ей не хватит прав сохранять настройки.
@@ -101,7 +102,7 @@ src/       — код программы (трогать не нужно)
    Fedora: `sudo dnf install python3 python3-tkinter`, Arch: `sudo pacman -S python tk`.
 2. **Перейди в папку программы** (путь подставь свой):
    ```bash
-   cd ~/Загрузки/Overlay-assistant-for-Claude-main
+   cd ~/Загрузки/Overlay-assistant-for-AI-main
    ```
 3. **Запусти установку:**
    ```bash
