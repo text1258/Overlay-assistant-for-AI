@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
         "учитывая всё, о чём мы договорились раньше."
     ),
     "max_image_side": 1600,     # px, длинная сторона скриншота
+    "math": "latex",            # latex — формулы картинками, plain — простым текстом
     "overlay": {
         "width": 460,
         "max_height": 420,
@@ -65,6 +66,7 @@ DEFAULT_CONFIG = {
         "respect_taskbar": True,   # не заходить на панель задач
         "display_mode": "panel",   # panel — текстом в панели, screen — пометками по экрану
         "marks_seconds": 0,        # через сколько секунд убирать пометки (0 — по клавише)
+        "marks_opacity": 0.9,      # непрозрачность рамок и подписей пометок
         "auto_hide_seconds": 0,    # 0 = не прятать автоматически
     },
     "hotkeys": {
@@ -89,7 +91,7 @@ DEFAULT_CLAUDE_MD = """# Экранный помощник
 
 - Отвечай по-русски, коротко и по делу: сначала сам ответ, потом, если нужно, пояснение.
 - Не используй Markdown-таблицы и заголовки; простые списки можно.
-- Формулы пиши простым Unicode-текстом (x², √x, ∫, ≤, π, →), не LaTeX — панель его не рисует.
+- Формулы оформляй в LaTeX ($...$ в строке, $$...$$ отдельной строкой) — приложение рисует их.
 - Если на скриншоте несколько вопросов или задач — ответь на каждый, пронумеровав.
 - Учитывай всё, что обсуждалось в этом диалоге раньше: договорённости, присланные файлы.
 - Прикреплённые файлы лежат в папке files/ — читай их инструментом Read.
@@ -124,7 +126,7 @@ def save_json(path, data):
 # ----------------------------------------------------------------------------
 # Вспомогательное
 # ----------------------------------------------------------------------------
-def clean_md(s: str) -> str:
+def clean_md(s: str, strip=True) -> str:
     """Лёгкая чистка Markdown для показа в простом окне."""
     s = re.sub(r"^\s*```.*$\n?", "", s, flags=re.M)
     s = re.sub(r"\*\*(.+?)\*\*", r"\1", s, flags=re.S)
@@ -132,7 +134,7 @@ def clean_md(s: str) -> str:
     s = re.sub(r"^#{1,6}\s*", "", s, flags=re.M)
     s = re.sub(r"`([^`\n]+)`", r"\1", s)
     s = re.sub(r"^(\s*)[-*]\s+", r"\1• ", s, flags=re.M)
-    return s.strip("\n")
+    return s.strip("\n") if strip else s
 
 
 def image_to_block(img: Image.Image, max_side: int) -> dict:
@@ -826,7 +828,8 @@ class Overlay:
     def set_text(self, s, scroll_end=False):
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-        self.text.insert("1.0", clean_md(s))
+        insert_rich(self.text, (s or "").strip("\n"), fg=self.colors["fg"], bg=self.colors["bg"],
+                    size_pt=self.cfg["font_size"], enabled=self.full.get("math", "latex") == "latex")
         self.text.configure(state="disabled")
         if scroll_end:
             self.text.see("end")
@@ -875,13 +878,18 @@ class Overlay:
         x, y = self._position(width, max_h)
         self.win.geometry(f"{width}x{max_h}+{x}+{y}")
         self.win.update_idletasks()
-        try:
-            r = self.text.count("1.0", "end-1c", "displaylines")
-            n = r[0] if isinstance(r, tuple) else (r or 0)
+        has_text = bool(self.text.get("1.0", "end-1c").strip()) or bool(self.text.image_names())
+        try:  # высота в пикселях — учитывает и картинки-формулы
+            r = self.text.count("1.0", "end", "ypixels")
+            px = r[0] if isinstance(r, tuple) else (r or 0)
+            body = px + 12 + 6 if has_text else 4
         except Exception:
-            n = int(self.text.index("end-1c").split(".")[0])
-        has_text = bool(self.text.get("1.0", "end-1c").strip())
-        body = (n + 1) * self.font.metrics("linespace") + 14 if has_text else 4
+            try:
+                r = self.text.count("1.0", "end-1c", "displaylines")
+                n = r[0] if isinstance(r, tuple) else (r or 0)
+            except Exception:
+                n = int(self.text.index("end-1c").split(".")[0])
+            body = (n + 1) * self.font.metrics("linespace") + 14 if has_text else 4
         h = max(head_h + 8, min(max_h, head_h + body + 4))
         x, y = self._position(width, h)
         self.win.geometry(f"{width}x{h}+{x}+{y}")
@@ -1025,6 +1033,11 @@ def ensure_dirs():
     md = WORK / "CLAUDE.md"
     if not md.exists():
         md.write_text(DEFAULT_CLAUDE_MD, encoding="utf-8")
+    else:  # старая строка «не LaTeX» из прошлых версий → новая
+        old = '- Формулы пиши простым Unicode-текстом (x², √x, ∫, ≤, π, →), не LaTeX — панель его не рисует.\n'
+        txt = md.read_text(encoding="utf-8")
+        if old in txt:
+            md.write_text(txt.replace(old, '- Формулы оформляй в LaTeX ($...$ в строке, $$...$$ отдельной строкой) — приложение рисует их.\n'), encoding="utf-8")
 
 
 def load_config():
@@ -1406,6 +1419,7 @@ SCREEN_PROMPT = """Ответь в режиме «пометки на экран
 подпись: вопрос, вариант ответа, поле, кнопка, строка, ошибка.
 - Одна пометка — одно место, не больше 12 пометок, по порядку чтения.
 - В text — сам ответ или действие (до ~15 слов), без рассуждений.
+- Формулы в text пиши простым текстом (x², √x, (a+b)/c), без LaTeX.
 - Если показывать на экране нечего — пустой marks и ответ в summary."""
 
 
@@ -1550,7 +1564,7 @@ class ScreenMarks:
         k = mapping["scale"] or 1.0
         placed = []
         wrap = max(200, min(420, int(self.cfg.get("width", 460) * 0.8)))
-        alpha = max(0.75, float(self.cfg.get("opacity", 0.85)))
+        alpha = min(1.0, max(0.2, float(self.cfg.get("marks_opacity", 0.9))))
 
         def label(text, number=None):
             t = self._win(c["accent"], alpha)
@@ -1587,8 +1601,8 @@ class ScreenMarks:
             e = self.EDGE
             for (x, y, w, h) in ((x1, y1, x2 - x1, e), (x1, y2 - e, x2 - x1, e),
                                  (x1, y1, e, y2 - y1), (x2 - e, y1, e, y2 - y1)):
-                self._place(self._win(c["accent"]), x, y, w, h)
-            t, w, h = label(m["text"] or "•", i)
+                self._place(self._win(c["accent"], alpha), x, y, w, h)
+            t, w, h = label(strip_latex(m["text"]) or "•", i)
             gap = 8
             for (x, y) in ((x2 + gap, y1), (x1 - gap - w, y1), (x1, y2 + gap), (x1, y1 - gap - h),
                            (x2 - w, y2 + gap), (x2 + gap, y2 - h)):
@@ -1601,7 +1615,7 @@ class ScreenMarks:
             self._place(t, x, y, w, h)
 
         if parsed["summary"]:
-            t, w, h = label(parsed["summary"])
+            t, w, h = label(strip_latex(parsed["summary"]))
             cx = mapping["ox"] + 16
             cy = mapping["oy"] + 16
             for (x, y) in ((cx, cy), (AR - w - 16, AT + 16), (AL + 16, AB - h - 16), (AR - w - 16, AB - h - 16)):
@@ -1616,3 +1630,129 @@ class ScreenMarks:
         sec = self.cfg.get("marks_seconds") or 0
         if sec > 0:
             self._hide_job = self.root.after(int(sec * 1000), self.hide)
+
+
+# ----------------------------------------------------------------------------
+# Формулы LaTeX: рисуются картинками через matplotlib (mathtext)
+# ----------------------------------------------------------------------------
+MATH_MODES = [("latex", "LaTeX — рисовать формулы"), ("plain", "Простой текст (x², √x)")]
+
+LATEX_NOTE = ("Формулы оформляй в LaTeX: в строке — $...$, отдельной строкой — $$...$$. "
+              "Деление — \\frac{}{}, над векторами — \\vec{}. Без окружений "
+              "(cases, matrix, align) — их приложение не нарисует.")
+PLAIN_NOTE = "Формулы пиши простым текстом (x², √x, ∫, ≤, π, →), без LaTeX."
+
+# $$…$$, \[…\], \(…\), $…$ (одиночный $ — не у цифр и букв, чтобы «5$» не считалось формулой)
+MATH_RE = re.compile(r"\$\$(.+?)\$\$|\\\[(.+?)\\\]|\\\((.+?)\\\)"
+                     r"|(?<![\\$\w])\$(?![\s$])([^$\n]+?)(?<![\s\\])\$(?![\w$])", re.S)
+
+
+def math_note(cfg):
+    return LATEX_NOTE if cfg.get("math", "latex") == "latex" else PLAIN_NOTE
+
+
+def strip_latex(s):
+    """Грубо убрать LaTeX-разметку (для мест, где формулы не рисуются)."""
+    s = MATH_RE.sub(lambda m: next(g for g in m.groups() if g is not None), s)
+    s = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r"(\1)/(\2)", s)
+    s = re.sub(r"\\(?:vec|overrightarrow|mathbf|text|mathrm)\{([^{}]*)\}", r"\1", s)
+    s = s.replace("\\cdot", "·").replace("\\times", "×").replace("\\sqrt", "√")
+    s = s.replace("\\pi", "π").replace("\\le", "≤").replace("\\ge", "≥").replace("\\pm", "±")
+    return re.sub(r"\\([a-zA-Z]+)", r"\1", s)
+
+
+class MathRenderer:
+    """LaTeX → картинка. Без matplotlib просто возвращает None (формула останется текстом)."""
+
+    def __init__(self):
+        self.available = None
+        self._lock = threading.Lock()
+        self._cache = {}
+
+    def _load(self):
+        with self._lock:
+            if self.available is None:
+                try:
+                    import matplotlib
+                    matplotlib.use("Agg")
+                    matplotlib.rcParams["mathtext.fontset"] = "cm"
+                    import importlib
+                    importlib.import_module("matplotlib.figure")
+                    importlib.import_module("matplotlib.backends.backend_agg")
+                    self.available = True
+                except Exception:
+                    self.available = False
+            return self.available
+
+    def preload(self):
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def image(self, tex, size_pt, fg, bg, dpi, display=False, max_w=None):
+        """PhotoImage с формулой или None, если нарисовать не вышло."""
+        key = (tex, size_pt, fg, bg, round(dpi), display, max_w)
+        if key in self._cache:
+            return self._cache[key]
+        img = None
+        if self._load():
+            try:
+                from matplotlib.figure import Figure
+                from matplotlib.backends.backend_agg import FigureCanvasAgg
+                from matplotlib.font_manager import FontProperties
+                fig = Figure(figsize=(1, 1))
+                FigureCanvasAgg(fig)
+                prop = FontProperties(size=size_pt * (1.3 if display else 1.12))
+                fig.text(0, 0, f"${tex.strip()}$", fontproperties=prop, color=fg)
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png", dpi=dpi, facecolor=bg,
+                            bbox_inches="tight", pad_inches=0.03)
+                pil = Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
+                if max_w and pil.width > max_w:
+                    pil = pil.resize((max_w, max(1, int(pil.height * max_w / pil.width))),
+                                     Image.LANCZOS)
+                img = ImageTk.PhotoImage(pil)
+            except Exception:
+                img = None
+        if len(self._cache) > 400:
+            self._cache.clear()
+        self._cache[key] = img
+        return img
+
+
+MATH = MathRenderer()
+
+
+def insert_rich(widget, text, *, fg, bg, size_pt, enabled=True, tags=()):
+    """Дописать в конец tk.Text текст с Markdown-чисткой и формулами-картинками."""
+    if not enabled:
+        widget.insert("end", clean_md(text, strip=False), tags)
+        return
+    imgs = widget.__dict__.setdefault("_math_imgs", [])
+    try:
+        dpi = widget.winfo_fpixels("1i")
+    except tk.TclError:
+        dpi = 96
+    max_w = max(120, widget.winfo_width() - 40) if widget.winfo_width() > 50 else None
+    widget.tag_configure("math_center", justify="center")
+    pos = 0
+    for m in MATH_RE.finditer(text):
+        widget.insert("end", clean_md(text[pos:m.start()], strip=False), tags)
+        pos = m.end()
+        display = m.group(1) is not None or m.group(2) is not None
+        tex = next(g for g in m.groups() if g is not None)
+        img = MATH.image(tex, size_pt, fg, bg, dpi, display, max_w)
+        if img is None:
+            widget.insert("end", m.group(0), tags)
+            continue
+        imgs.append(img)
+        if display:
+            if widget.get("end-2c", "end-1c") not in ("\n", ""):
+                widget.insert("end", "\n", tags)
+            widget.image_create("end", image=img, align="center", padx=2, pady=4)
+            widget.insert("end", "\n", ("math_center",) + tuple(tags))
+            widget.tag_add("math_center", "end-2l linestart", "end-2l lineend")
+            # пропустить перевод строки сразу после $$…$$, чтобы не было пустой строки
+            if text[pos:pos + 1] == "\n":
+                pos += 1
+        else:
+            widget.image_create("end", image=img, align="center", padx=1)
+    widget.insert("end", clean_md(text[pos:], strip=False), tags)

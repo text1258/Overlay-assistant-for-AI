@@ -24,7 +24,7 @@ from core import (
     ACTION_NAMES, ANCHORS, CHATS, CONFIG_PATH, DEFAULT_CONFIG, DEFAULT_TITLE, FILES, IMAGE_EXT,
     IS_WIN, MANAGER_TITLE, MODELS, MODEL_LABEL_DEFAULT, NO_WINDOW, WHO_NAMES, WORK,
     _MOD_KEYSYMS, ClaudeRunner, Overlay, acquire_chat, append_messages, auth_status,
-    chat_busy_by, chats_signature, claude_env, claude_version, clean_md, clear_pid,
+    chat_busy_by, chats_signature, claude_env, claude_version, clear_pid,
     copy_unique, create_chat, delete_chat, docx_to_text, ensure_dirs, find_claude,
     get_active_chat, image_to_block, install_command, key_name_from_event, launch,
     list_chats, load_chat, load_config, load_state, migrate_old_state, mods_from_state,
@@ -32,6 +32,7 @@ from core import (
     running_pid, save_json, send_command, set_active_chat, set_dpi_aware,
     set_hotkeys_paused, take_commands, update_chat, update_state, write_pid,
     THEME_LABELS, monitor_choices, DISPLAY_MODES, ScreenMarks, pick_monitor,
+    MATH, MATH_MODES, insert_rich, math_note,
 )
 
 FAM = "Segoe UI" if IS_WIN else "Helvetica"
@@ -53,12 +54,19 @@ class SettingsWindow:
 
         t = self.top = tk.Toplevel(app.root)
         t.title("Настройки")
-        t.geometry("800x720")
-        t.minsize(600, 500)
+        sh = t.winfo_screenheight()
+        t.geometry(f"820x{max(480, min(780, sh - 120))}")
+        t.minsize(600, 420)
         t.transient(app.root)
         t.protocol("WM_DELETE_WINDOW", self.cancel)
         t.bind("<KeyPress>", self._key_press)
         t.bind("<KeyRelease>", self._key_release)
+
+        # кнопки внизу упаковываются первыми — их никогда не вытеснит содержимое
+        bar = ttk.Frame(t, padding=(8, 0, 8, 8))
+        bar.pack(side="bottom", fill="x")
+        ttk.Button(bar, text="Отмена", command=self.cancel).pack(side="right")
+        ttk.Button(bar, text="Сохранить", command=self.save).pack(side="right", padx=6)
 
         nb = self.nb = ttk.Notebook(t)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
@@ -68,24 +76,58 @@ class SettingsWindow:
                                   ("look", "Вид панели", self._tab_look),
                                   ("position", "Положение", self._tab_position),
                                   ("claude", "Claude", self._tab_claude)):
-            f = ttk.Frame(nb, padding=14)
-            nb.add(f, text=title)
-            build(f)
-            self.tabs[key] = f
+            outer, inner = self._scroll_tab(nb)
+            nb.add(outer, text=title)
+            build(inner)
+            self.tabs[key] = outer
         self.select(tab)
-
-        bar = ttk.Frame(t, padding=(8, 0, 8, 8))
-        bar.pack(fill="x")
-        ttk.Button(bar, text="Отмена", command=self.cancel).pack(side="right")
-        ttk.Button(bar, text="Сохранить", command=self.save).pack(side="right", padx=6)
         self._live_job = None
         for v in self.ov.values():
             v.trace_add("write", self._live)
         for k, v in self.pos.items():
-            v.trace_add("write", self._live if k in ("display_mode", "marks_seconds")
+            v.trace_add("write", self._live if k in ("display_mode", "marks_seconds", "marks_opacity")
                         else self._pos_changed)
         self.refresh_auth()
         self._ready = True
+
+    def _scroll_tab(self, nb):
+        """Вкладка с прокруткой: если содержимое не влезает по высоте, появляется полоса."""
+        outer = ttk.Frame(nb)
+        bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        canvas = tk.Canvas(outer, highlightthickness=0, bd=0, bg=bg)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas, padding=14)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def update(_=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            need = inner.winfo_reqheight() > canvas.winfo_height() > 1
+            if need and not vsb.winfo_ismapped():
+                vsb.pack(side="right", fill="y", before=canvas)
+            elif not need and vsb.winfo_ismapped():
+                vsb.pack_forget()
+                canvas.yview_moveto(0)
+
+        def wheel(e):
+            if inner.winfo_reqheight() <= canvas.winfo_height():
+                return
+            if e.num == 4:
+                step = -1
+            elif e.num == 5:
+                step = 1
+            else:
+                step = -1 if e.delta > 0 else 1
+            canvas.yview_scroll(step * 3, "units")
+
+        inner.bind("<Configure>", update)
+        canvas.bind("<Configure>", lambda e: (canvas.itemconfigure(win, width=e.width), update()))
+        outer.bind("<Enter>", lambda e: [canvas.bind_all(ev, wheel) for ev in
+                                         ("<MouseWheel>", "<Button-4>", "<Button-5>")])
+        outer.bind("<Leave>", lambda e: [canvas.unbind_all(ev) for ev in
+                                         ("<MouseWheel>", "<Button-4>", "<Button-5>")])
+        return outer, inner
 
     def select(self, tab):
         self.nb.select(self.tabs.get(tab, self.tabs["account"]))
@@ -370,6 +412,7 @@ class SettingsWindow:
             "respect_taskbar": tk.BooleanVar(value=o.get("respect_taskbar", True)),
             "display_mode": tk.StringVar(value=o.get("display_mode", "panel")),
             "marks_seconds": tk.IntVar(value=o.get("marks_seconds", 0)),
+            "marks_opacity": tk.DoubleVar(value=o.get("marks_opacity", 0.9)),
         }
         mf = ttk.LabelFrame(f, text="Как показывать ответ", padding=(10, 6))
         mf.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
@@ -388,6 +431,14 @@ class SettingsWindow:
         ttk.Spinbox(sr, from_=0, to=600, increment=5, width=6,
                     textvariable=self.pos["marks_seconds"]).pack(side="left", padx=8)
         ttk.Label(sr, text="0 — пока не скрыть клавишей", foreground="#777").pack(side="left")
+        orow = ttk.Frame(mf)
+        orow.pack(anchor="w", pady=(6, 0))
+        ttk.Label(orow, text="Непрозрачность пометок").pack(side="left")
+        mo_lbl = ttk.Label(orow, text=f"{int(o.get('marks_opacity', 0.9) * 100)}%", width=5)
+        ttk.Scale(orow, from_=0.2, to=1.0, variable=self.pos["marks_opacity"], length=160,
+                  command=lambda v: mo_lbl.configure(text=f"{int(float(v) * 100)}%")).pack(
+            side="left", padx=8)
+        mo_lbl.pack(side="left")
         ttk.Label(f, text="Панель с текстом", font=(FAM, 10, "bold")).grid(
             row=1, column=0, columnspan=3, sticky="w")
         ttk.Label(f, text="Монитор").grid(row=3, column=0, sticky="w", pady=4)
@@ -518,6 +569,19 @@ class SettingsWindow:
             "В CLAUDE.md — то, что Claude учитывает в каждом ответе: язык, стиль, "
             "краткость. Изменения действуют с нового диалога.")).grid(
             row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(f, text="Формулы").grid(row=8, column=0, sticky="w", pady=(14, 4))
+        self.math_var = tk.StringVar(value=dict(MATH_MODES).get(self.cfg.get("math", "latex"),
+                                                                MATH_MODES[0][1]))
+        ttk.Combobox(f, textvariable=self.math_var, values=[m[1] for m in MATH_MODES],
+                     state="readonly", width=26).grid(row=8, column=1, columnspan=2, sticky="w",
+                                                      padx=8, pady=(14, 4))
+        ok = MATH._load()
+        ttk.Label(f, wraplength=680, foreground="#666" if ok else "#b3261e", text=(
+            "Формулы LaTeX рисуются картинками в панели и в переписке: дроби, корни, "
+            "векторы, интегралы. В пометках по экрану — простым текстом."
+            if ok else "Для рисования формул нужна библиотека matplotlib — запусти install.bat "
+            "ещё раз. Пока формулы показываются как текст LaTeX.")).grid(
+            row=9, column=0, columnspan=3, sticky="w")
         f.columnconfigure(2, weight=1)
 
     def _browse(self):
@@ -549,11 +613,14 @@ class SettingsWindow:
             o["respect_taskbar"] = bool(self.pos["respect_taskbar"].get())
             o["display_mode"] = self.pos["display_mode"].get() or "panel"
             o["marks_seconds"] = num(self.pos["marks_seconds"], 0, 600, "Убирать пометки через")
+            o["marks_opacity"] = round(num(self.pos["marks_opacity"], 0.2, 1.0,
+                                           "Непрозрачность пометок", float), 2)
             self.cfg["max_image_side"] = num(self.side_var, 600, 3000, "Размер скриншота")
         except ValueError as e:
             return str(e)
         m = self.model_var.get()
         self.cfg["model"] = "" if m == MODEL_LABEL_DEFAULT else m
+        self.cfg["math"] = {v: k for k, v in MATH_MODES}.get(self.math_var.get(), "latex")
         self.cfg["screenshot_prompt"] = (self.prompt_txt.get("1.0", "end-1c").strip()
                                          or DEFAULT_CONFIG["screenshot_prompt"])
         self.cfg["claude_path"] = self.path_var.get().strip()
@@ -617,6 +684,7 @@ class Manager:
         self.chats_sig = None
         self.chat_ids = []
 
+        MATH.preload()
         self.root = root = tk.Tk()
         root.title(MANAGER_TITLE)
         root.geometry("980x700")
@@ -848,7 +916,12 @@ class Manager:
             v.insert("end", text + "\n\n", "sys")
         else:
             v.insert("end", ("Вы" if role == "you" else "Claude") + "\n", role)
-            v.insert("end", (clean_md(text) if role == "claude" else text) + "\n\n")
+            if role == "claude":
+                insert_rich(v, text, fg="#1d1d1f", bg="#fbfaf8", size_pt=10,
+                            enabled=self.cfg.get("math", "latex") == "latex")
+                v.insert("end", "\n\n")
+            else:
+                v.insert("end", text + "\n\n")
         v.see("end")
 
     def _sys(self, text):
@@ -915,6 +988,7 @@ class Manager:
         if notes:
             prompt += ("\n\nЯ прикрепил файлы (прочитай их инструментом Read):\n"
                        + "\n".join("- " + n for n in notes))
+        prompt += "\n\n(" + math_note(self.cfg) + ")"
         content = [{"type": "text", "text": prompt}] + blocks
         shown = text
         if self.attachments:
@@ -998,7 +1072,9 @@ class Manager:
             return
         v = self.chat_view
         v.delete("ans", "end-1c")
-        v.insert("end", clean_md(self.cur_text) + ("\n\n" if final else " ▍\n\n"))
+        insert_rich(v, self.cur_text, fg="#1d1d1f", bg="#fbfaf8", size_pt=10,
+                    enabled=self.cfg.get("math", "latex") == "latex")
+        v.insert("end", "\n\n" if final else " ▍\n\n")
         v.see("end")
 
     def _finish(self, text, sid, clear_session):
@@ -1079,6 +1155,8 @@ class Manager:
         self.cfg = cfg
         save_json(CONFIG_PATH, cfg)  # оверлей подхватит изменения сам
         self._update_help()
+        if not self.busy:
+            self._show_chat(self.chat["id"])
 
     def preview_panel(self):
         if self._preview is None:

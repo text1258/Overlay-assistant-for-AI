@@ -14,7 +14,7 @@ import tkinter as tk
 from core import (
     ACTION_NAMES, CONFIG_PATH, STATE_PATH, WHO_NAMES, ClaudeRunner, Overlay, PynputHotkeys,
     RegionSelector, WinHotkeys, IS_WIN, MANAGER_TITLE, SCREEN_PROMPT, ScreenMarks,
-    acquire_chat, append_messages, fit_for_vision, marks_as_text, parse_marks,
+    acquire_chat, append_messages, fit_for_vision, marks_as_text, parse_marks, MATH, math_note,
     auth_status, claude_version, clear_pid, ensure_dirs, find_claude, focus_window,
     get_active_chat, grab_screen_at, hotkeys_paused, image_to_block, launch, load_chat,
     load_config, load_state, migrate_old_state, mtime, pretty_combo, release_chat,
@@ -49,6 +49,7 @@ class OverlayApp:
         self.shown = ""
         self._render_job = None
 
+        MATH.preload()
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("Claude Overlay — оверлей")
@@ -184,7 +185,7 @@ class OverlayApp:
                 shown += " · пометки на экране"
             else:
                 self.mapping = None
-                content = [{"type": "text", "text": prompt},
+                content = [{"type": "text", "text": prompt + "\n\n(" + math_note(self.cfg) + ")"},
                            image_to_block(img, self.cfg["max_image_side"])]
             self.start_request(chat, content, shown)
 
