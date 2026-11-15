@@ -776,6 +776,7 @@ class Overlay:
         self.root, self.state, self.on_moved = root, state, on_moved
         self.full, self.cfg = cfg, cfg["overlay"]
         self.visible = False
+        self.muted = False  # скрыто пользователем: само не появляется, пока не покажут снова
         self.move_mode = False
         self._hide_job = None
         self._fit_job = None
@@ -841,6 +842,8 @@ class Overlay:
 
     # --- видимость -------------------------------------------------------
     def show(self):
+        if self.muted:
+            return
         if not self.visible:
             self._area = None  # монитор выбирается заново при каждом появлении
             if self.cfg.get("theme") == "system":
@@ -908,6 +911,8 @@ class Overlay:
 
     def flash(self, text, seconds=6):
         """Короткое служебное сообщение в панели."""
+        if self.muted:  # панель скрыта пользователем — не показываем и не затираем ответ
+            return
         self.show()
         self.set_status("")
         self.set_text(text)
@@ -1560,6 +1565,7 @@ class ScreenMarks:
         self.cfg = cfg["overlay"]
         self.wins = []
         self.visible = False
+        self.muted = False  # скрыто пользователем
         self._hide_job = None
         fam = "Segoe UI" if IS_WIN else "Helvetica"
         self.font = tkfont.Font(family=fam, size=self.cfg["font_size"])
@@ -1591,6 +1597,8 @@ class ScreenMarks:
         self.visible = False
 
     def show(self):
+        if self.muted:
+            return
         for w in self.wins:
             w.deiconify()
             make_click_through(w)

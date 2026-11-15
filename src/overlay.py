@@ -61,6 +61,7 @@ class OverlayApp:
         self.panel = Overlay(self.root, self.cfg, self.state, self._moved)
         self.marks = ScreenMarks(self.root, self.cfg)
         self.mapping = None  # куда переносить координаты пометок (режим «по экрану»)
+        self.last_view = "panel"  # что показать при «показать»: панель или пометки
 
         self.hotkeys = None
         self.paused = hotkeys_paused()
@@ -95,16 +96,13 @@ class OverlayApp:
         elif action == "region":
             self.shot(region=True)
         elif action == "toggle":
-            if self.marks.has_marks and not self.panel.visible:
-                self.marks.toggle()  # в режиме «по экрану» скрывает/показывает пометки
-            else:
-                self.panel.cancel_hide()
-                self.panel.toggle()
+            self.toggle_view()
         elif action == "scroll_up":
             self.panel.scroll(-1)
         elif action == "scroll_down":
             self.panel.scroll(1)
         elif action == "move":
+            self._set_muted(False)
             self.panel.toggle_move()
         elif action == "stop":
             if self.busy:
@@ -113,6 +111,32 @@ class OverlayApp:
             self.open_manager()
         elif action == "quit":
             self.quit()
+
+    # --- скрыть / показать ---------------------------------------------------
+    def _set_muted(self, muted):
+        self.panel.muted = self.marks.muted = muted
+
+    def toggle_view(self):
+        """Скрыть: панель и пометки не появляются сами — даже после нового скриншота
+        (ответ всё равно придёт и сохранится). Показать: последний ответ."""
+        if self.panel.muted or self.panel.visible or self.marks.visible:
+            if self.panel.muted:
+                self._set_muted(False)
+                self._show_last()
+            else:
+                self.panel.cancel_hide()
+                self.panel.hide()
+                self.marks.hide()
+                self._set_muted(True)
+        else:
+            self._show_last()  # панель исчезла сама (автоскрытие) — просто показать
+
+    def _show_last(self):
+        self.panel.cancel_hide()
+        if self.last_view == "marks" and self.marks.has_marks and not self.busy:
+            self.marks.show()
+        else:
+            self.panel.show()
 
     def open_manager(self):
         if running_pid("manager"):
@@ -230,6 +254,7 @@ class OverlayApp:
         self.panel.cancel_hide()
         self.panel.show()
         self.panel.set_text("")
+        self.last_view = "panel"
         self.panel.set_who(PROVIDER_SHORT[provider])
         self.panel.set_status(f"думаю… · {chat.get('title')}")
         self.spec = build_spec(provider, fresh, self.cfg, content)
@@ -300,8 +325,12 @@ class OverlayApp:
             self.panel.set_text("")
             try:
                 self.marks.draw(parsed, self.mapping)
-            except Exception as e:
-                self.panel.flash(f"Не удалось нарисовать пометки: {e}\n\n{marks_as_text(parsed)}", 20)
+                self.last_view = "marks"
+            except Exception as e:  # не flash: если панель скрыта, текст должен дождаться показа
+                self.panel.set_text(f"Не удалось нарисовать пометки: {e}\n\n{marks_as_text(parsed)}")
+                self.panel.set_status("")
+                self.panel.show()
+                self.panel.schedule_hide()
             text = marks_as_text(parsed)
         else:
             if self.mapping and not text.startswith(("⚠", "⏹")):
