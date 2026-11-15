@@ -15,6 +15,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -26,7 +27,7 @@ from xml.etree import ElementTree as ET
 
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import mss
 from PIL import Image, ImageEnhance, ImageTk
@@ -227,6 +228,8 @@ class WinHotkeys(threading.Thread):
         self.tid = kernel32.GetCurrentThreadId()
         ids, failed = {}, []
         for i, (action, combo) in enumerate(self.bindings.items(), start=1):
+            if not combo:
+                continue  # сочетание отключено
             try:
                 mods, vk = parse_combo_win(combo)
             except ValueError as e:
@@ -246,8 +249,13 @@ class WinHotkeys(threading.Thread):
             user32.UnregisterHotKey(None, i)
 
     def stop(self):
+        for _ in range(50):  # поток мог ещё не успеть стартовать
+            if self.tid or not self.is_alive():
+                break
+            time.sleep(0.01)
         if self.tid:
             ctypes.windll.user32.PostThreadMessageW(self.tid, 0x0012, 0, 0)  # WM_QUIT
+        self.join(1.5)  # дождаться UnregisterHotKey, иначе новые клавиши будут «заняты»
 
 
 class PynputHotkeys:
@@ -266,6 +274,8 @@ class PynputHotkeys:
                  "down": "<down>", "left": "<left>", "right": "<right>"}
         mapping = {}
         for action, combo in bindings.items():
+            if not combo:
+                continue
             parts = [names.get(p, f"<{p}>" if re.fullmatch(r"f\d+", p) else p)
                      for p in combo.lower().replace(" ", "").split("+")]
             mapping["+".join(parts)] = (lambda a=action: post(("hotkey", a)))
@@ -283,9 +293,166 @@ class PynputHotkeys:
             self.listener.stop()
 
 
+ACTION_NAMES = [
+    ("shot", "Скриншот всего экрана → Claude"),
+    ("region", "Скриншот области → Claude"),
+    ("toggle", "Скрыть / показать панель"),
+    ("scroll_up", "Прокрутить ответ вверх"),
+    ("scroll_down", "Прокрутить ответ вниз"),
+    ("move", "Режим перемещения панели"),
+    ("chat", "Открыть окно чата"),
+    ("stop", "Остановить ответ"),
+]
+
+_PRETTY = {"pageup": "PgUp", "pagedown": "PgDn", "ctrl": "Ctrl", "alt": "Alt",
+           "shift": "Shift", "win": "Win", "space": "Space", "enter": "Enter"}
+
+
+def pretty_combo(combo: str) -> str:
+    if not combo:
+        return "— выкл —"
+    return "+".join(_PRETTY.get(p, p.upper() if len(p) <= 3 else p.capitalize())
+                    for p in combo.lower().replace(" ", "").split("+"))
+
+
+_MOD_KEYSYMS = {"Control_L": "ctrl", "Control_R": "ctrl", "Alt_L": "alt", "Alt_R": "alt",
+                "Shift_L": "shift", "Shift_R": "shift", "Win_L": "win", "Win_R": "win",
+                "Super_L": "win", "Super_R": "win", "Meta_L": "alt", "Meta_R": "alt",
+                "ISO_Level3_Shift": "alt", "App": None, "Caps_Lock": None, "Num_Lock": None}
+_VK_NAMES = {v: k for k, v in _VK.items() if k != "esc"}
+_KEYSYM_NAMES = {"Prior": "pageup", "Next": "pagedown", "Up": "up", "Down": "down",
+                 "Left": "left", "Right": "right", "space": "space", "Return": "enter",
+                 "Tab": "tab", "Home": "home", "End": "end", "Insert": "insert",
+                 "Delete": "delete", "grave": "`", "minus": "-", "equal": "=",
+                 "bracketleft": "[", "bracketright": "]", "semicolon": ";",
+                 "apostrophe": "'", "comma": ",", "period": ".", "slash": "/"}
+
+
+def key_name_from_event(e):
+    """Имя основной клавиши по физической кнопке (не зависит от раскладки на Windows)."""
+    if IS_WIN:
+        vk = e.keycode
+        if 0x41 <= vk <= 0x5A or 0x30 <= vk <= 0x39:
+            return chr(vk).lower()
+        if 0x70 <= vk <= 0x87:
+            return f"f{vk - 0x6F}"
+        return _VK_NAMES.get(vk)
+    ks = e.keysym
+    if ks in _KEYSYM_NAMES:
+        return _KEYSYM_NAMES[ks]
+    if re.fullmatch(r"F\d+", ks):
+        return ks.lower()
+    if len(ks) == 1 and ks.isascii() and ks.isalnum():
+        return ks.lower()
+    return None
+
+
+def mods_from_state(state: int) -> set:
+    mods = set()
+    if state & 0x4:
+        mods.add("ctrl")
+    if state & 0x1:
+        mods.add("shift")
+    if (IS_WIN and state & 0x20000) or (not IS_WIN and state & 0x8):
+        mods.add("alt")
+    return mods
+
+
 # ----------------------------------------------------------------------------
 # Запуск Claude Code (по подписке)
 # ----------------------------------------------------------------------------
+NO_WINDOW = 0x08000000 if IS_WIN else 0
+
+
+def claude_env():
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)  # чтобы точно шла подписка, а не API
+    return env
+
+
+def _find_value(obj, keys):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in keys and isinstance(v, (str, int)) and str(v):
+                return str(v)
+        for v in obj.values():
+            r = _find_value(v, keys)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_value(v, keys)
+            if r:
+                return r
+    return None
+
+
+def claude_version(exe):
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True, timeout=30,
+                           env=claude_env(), creationflags=NO_WINDOW)
+        return r.stdout.decode("utf-8", "replace").strip()[:40]
+    except Exception:
+        return ""
+
+
+def auth_status(exe):
+    """(вошёл ли, описание) — через `claude auth status`."""
+    try:
+        r = subprocess.run([exe, "auth", "status"], capture_output=True, timeout=40,
+                           env=claude_env(), creationflags=NO_WINDOW)
+    except Exception as e:
+        return False, f"Не удалось проверить вход: {e}"
+    out = r.stdout.decode("utf-8", "replace").strip()
+    try:
+        j = json.loads(out)
+    except ValueError:
+        j = None
+    j = j if isinstance(j, dict) else {}
+    method = j.get("authMethod")
+    logged = r.returncode == 0 and method != "none" and j.get("loggedIn", True) is not False
+    if not logged:
+        return False, "Вход не выполнен."
+    email = _find_value(j, {"email", "emailAddress", "accountEmail"})
+    plan = _find_value(j, {"subscriptionType", "subscription", "plan"})
+    parts = ["✔ Вход выполнен"]
+    if email:
+        parts.append(email)
+    if plan:
+        parts.append(f"подписка: {plan}")
+    desc = " · ".join(parts)
+    if method in ("api_key", "api_key_helper"):
+        desc += ("\n⚠ Сейчас используется API-ключ, а не подписка. Нажми «Выйти» "
+                 "и войди заново аккаунтом claude.ai.")
+    elif method and method != "claude.ai":
+        desc += f"\n(способ входа: {method})"
+    return True, desc
+
+
+def open_in_terminal(args):
+    """Запустить команду в отдельном окне терминала (нужно для входа и установки)."""
+    if IS_WIN:
+        return subprocess.Popen(args, env=claude_env(), creationflags=subprocess.CREATE_NEW_CONSOLE)
+    cmd = " ".join(shlex.quote(a) for a in args)
+    if sys.platform == "darwin":
+        script = cmd.replace("\\", "\\\\").replace('"', '\\"')
+        return subprocess.Popen(["osascript", "-e", f'tell application "Terminal" to do script "{script}"',
+                                 "-e", 'tell application "Terminal" to activate'])
+    for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"],
+                 ["konsole", "-e"], ["xterm", "-e"]):
+        if shutil.which(term[0]):
+            return subprocess.Popen(term + ["bash", "-c", cmd + "; read -p 'Enter — закрыть '"],
+                                    env=claude_env())
+    return subprocess.Popen(args, env=claude_env())
+
+
+def install_command():
+    if IS_WIN:
+        return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit",
+                "-Command", "irm https://claude.ai/install.ps1 | iex"]
+    return ["bash", "-c", "curl -fsSL https://claude.ai/install.sh | bash"]
+
+
 def find_claude(cfg_path: str):
     if cfg_path and Path(cfg_path).exists():
         return cfg_path
@@ -342,8 +509,7 @@ class ClaudeRunner:
         # Только чтение файлов: никаких команд, правок и интернета
         args += ["--tools", "Read", "--allowedTools", "Read", "--disallowedTools", "mcp__*"]
 
-        env = os.environ.copy()
-        env.pop("ANTHROPIC_API_KEY", None)  # чтобы точно шла подписка, а не API
+        env = claude_env()
         msg = {"type": "user", "message": {"role": "user", "content": blocks},
                "parent_tool_use_id": None}
         payload = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
@@ -422,7 +588,8 @@ class Overlay:
     BG, FG, DIM, ACCENT = "#16181d", "#ececec", "#8b8f98", "#d97757"
 
     def __init__(self, root, cfg, state, on_moved):
-        self.root, self.cfg, self.state, self.on_moved = root, cfg["overlay"], state, on_moved
+        self.root, self.state, self.on_moved = root, state, on_moved
+        self.full, self.cfg = cfg, cfg["overlay"]
         self.visible = False
         self.move_mode = False
         self._hide_job = None
@@ -464,6 +631,13 @@ class Overlay:
             wd.bind("<B1-Motion>", self._drag_move)
             wd.bind("<ButtonRelease-1>", self._drag_end)
         self._keep_on_top()
+
+    def apply_config(self, cfg):
+        self.full, self.cfg = cfg, cfg["overlay"]
+        self.font.configure(size=self.cfg["font_size"])
+        self.small.configure(size=max(8, self.cfg["font_size"] - 2))
+        self.win.attributes("-alpha", self.cfg["opacity"])
+        self._schedule_fit()
 
     # --- видимость -------------------------------------------------------
     def show(self):
@@ -561,7 +735,9 @@ class Overlay:
         h = max(head_h + 8, min(max_h, head_h + body + 4))
         x, y = self._position(width, h)
         self.win.geometry(f"{width}x{h}+{x}+{y}")
-        self.hint.configure(text="Ctrl+Alt+PgUp/PgDn — прокрутка" if body + head_h > max_h else "")
+        hk = self.full["hotkeys"]
+        scroll = f"{pretty_combo(hk.get('scroll_up'))} / {pretty_combo(hk.get('scroll_down'))} — прокрутка"
+        self.hint.configure(text=scroll if body + head_h > max_h else "")
 
     def _position(self, w, h):
         pos = self.state.get("overlay_pos")
@@ -580,8 +756,8 @@ class Overlay:
         self.border.configure(bg=self.ACCENT if self.move_mode else self.BG)
         if self.move_mode:
             self.show()
-            self.set_status("режим перемещения: тащи мышью, колесо — прокрутка, "
-                            "Ctrl+Alt+M — закрепить")
+            self.set_status("перемещение: тащи мышью, колесо — прокрутка, "
+                            f"{pretty_combo(self.full['hotkeys'].get('move'))} — закрепить")
         else:
             self.set_status("")
         self._apply_click_through()
@@ -666,6 +842,441 @@ class RegionSelector:
 
 
 # ----------------------------------------------------------------------------
+# Окно настроек
+# ----------------------------------------------------------------------------
+CORNERS = [("top-right", "справа сверху"), ("top-left", "слева сверху"),
+           ("bottom-right", "справа снизу"), ("bottom-left", "слева снизу")]
+MODEL_LABEL_DEFAULT = "по умолчанию"
+MODELS = [MODEL_LABEL_DEFAULT, "sonnet", "opus", "haiku", "fable"]
+
+
+class SettingsWindow:
+    def __init__(self, app, tab="account"):
+        self.app = app
+        self.cfg = json.loads(json.dumps(app.cfg))  # рабочая копия
+        self.alive = True
+        self.capturing = None
+        self.mods = set()
+        self._login_deadline = 0
+        self._install_deadline = 0
+        app.stop_hotkeys()  # чтобы при назначении клавиш ничего не срабатывало
+
+        t = self.top = tk.Toplevel(app.root)
+        t.title("Настройки")
+        t.geometry("700x580")
+        t.minsize(600, 500)
+        t.transient(app.root)
+        t.protocol("WM_DELETE_WINDOW", self.cancel)
+        t.bind("<KeyPress>", self._key_press)
+        t.bind("<KeyRelease>", self._key_release)
+
+        nb = self.nb = ttk.Notebook(t)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+        self.tabs = {}
+        for key, title, build in (("account", "Аккаунт", self._tab_account),
+                                  ("hotkeys", "Горячие клавиши", self._tab_hotkeys),
+                                  ("overlay", "Панель", self._tab_overlay),
+                                  ("claude", "Claude", self._tab_claude)):
+            f = ttk.Frame(nb, padding=14)
+            nb.add(f, text=title)
+            build(f)
+            self.tabs[key] = f
+        self.select(tab)
+
+        bar = ttk.Frame(t, padding=(8, 0, 8, 8))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Отмена", command=self.cancel).pack(side="right")
+        ttk.Button(bar, text="Сохранить", command=self.save).pack(side="right", padx=6)
+        self.refresh_auth()
+
+    def select(self, tab):
+        self.nb.select(self.tabs.get(tab, self.tabs["account"]))
+
+    def lift(self, tab=None):
+        if tab:
+            self.select(tab)
+        self.top.deiconify()
+        self.top.lift()
+        self.top.focus_force()
+
+    # --- фоновые задачи ---------------------------------------------------
+    def _bg(self, func, done):
+        box = []
+        threading.Thread(target=lambda: box.append(func()), daemon=True).start()
+
+        def check():
+            if not self.alive:
+                return
+            if box:
+                done(box[0])
+            else:
+                self.top.after(150, check)
+        self.top.after(150, check)
+
+    def _exe(self):
+        return find_claude(self.path_var.get().strip() if hasattr(self, "path_var")
+                           else self.cfg.get("claude_path", ""))
+
+    # --- вкладка «Аккаунт» ------------------------------------------------
+    def _tab_account(self, f):
+        ttk.Label(f, wraplength=640, text=(
+            "Приложение работает через официальный Claude Code и расходует лимиты "
+            "твоей подписки Claude (Pro или Max). API-ключ не нужен.")).pack(anchor="w")
+        self.exe_var = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.exe_var, foreground="#555", wraplength=640).pack(
+            anchor="w", pady=(12, 0))
+        self.auth_var = tk.StringVar(value="Проверяю…")
+        ttk.Label(f, textvariable=self.auth_var, wraplength=640,
+                  font=("Segoe UI" if IS_WIN else "Helvetica", 11, "bold")).pack(anchor="w", pady=10)
+        row = ttk.Frame(f)
+        row.pack(anchor="w")
+        self.btn_install = ttk.Button(row, text="Установить Claude Code", command=self.install)
+        self.btn_login = ttk.Button(row, text="Войти в аккаунт Claude", command=self.login)
+        self.btn_logout = ttk.Button(row, text="Выйти", command=self.logout)
+        self.btn_refresh = ttk.Button(row, text="Обновить", command=self.refresh_auth)
+        for b in (self.btn_install, self.btn_login, self.btn_logout, self.btn_refresh):
+            b.pack(side="left", padx=(0, 6))
+        ttk.Label(f, wraplength=640, foreground="#666", text=(
+            "Как проходит вход: откроется окно терминала и браузер с claude.ai. Войди в "
+            "аккаунт и подтверди доступ. Если браузер покажет код, скопируй его в окно "
+            "терминала и нажми Enter. Статус здесь обновится сам.")).pack(anchor="w", pady=(14, 0))
+
+    def _show_auth(self, exe, version, logged, desc):
+        if not exe:
+            self.exe_var.set("Claude Code не найден на этом компьютере.")
+            self.auth_var.set("Сначала установи Claude Code — кнопка ниже. "
+                              "Установка займёт пару минут.")
+            self.btn_install.state(["!disabled"])
+            self.btn_login.state(["disabled"])
+            self.btn_logout.state(["disabled"])
+            return
+        self.exe_var.set(f"Claude Code {version}  ·  {exe}")
+        self.auth_var.set(desc)
+        self.btn_install.state(["disabled"])
+        self.btn_login.state(["!disabled"])
+        self.btn_logout.state(["!disabled" if logged else "disabled"])
+
+    def refresh_auth(self, then=None):
+        self.auth_var.set("Проверяю…")
+
+        def work():
+            exe = self._exe()
+            if not exe:
+                return None, "", False, ""
+            return (exe, claude_version(exe)) + auth_status(exe)
+
+        def done(res):
+            self._show_auth(*res)
+            if res[2]:
+                self.app.on_auth(True, res[3])
+            if then:
+                then(res)
+        self._bg(work, done)
+
+    def login(self):
+        exe = self._exe()
+        if not exe:
+            return
+        try:
+            open_in_terminal([exe, "auth", "login"])
+        except Exception as e:
+            self.auth_var.set(f"Не удалось запустить вход: {e}")
+            return
+        self.auth_var.set("Жду входа в браузере…")
+        self._login_deadline = time.time() + 600
+        self.top.after(4000, self._poll_login)
+
+    def _poll_login(self):
+        if not self.alive or not self._login_deadline:
+            return
+
+        def done(res):
+            if res[2]:
+                self._login_deadline = 0
+                self._show_auth(*res)
+                self.app.on_auth(True, res[3])
+            elif time.time() > self._login_deadline:
+                self._login_deadline = 0
+                self._show_auth(*res)
+                self.auth_var.set("Вход так и не завершился. Попробуй ещё раз.")
+            else:
+                self.auth_var.set("Жду входа в браузере…")
+                self.top.after(3000, self._poll_login)
+        exe = self._exe()
+        self._bg(lambda: (exe, claude_version(exe)) + auth_status(exe), done)
+
+    def logout(self):
+        exe = self._exe()
+        if not exe or not messagebox.askyesno(
+                "Выход", "Выйти из аккаунта Claude в Claude Code?", parent=self.top):
+            return
+        self.auth_var.set("Выхожу…")
+        self._bg(lambda: subprocess.run([exe, "auth", "logout"], capture_output=True, timeout=60,
+                                        env=claude_env(), creationflags=NO_WINDOW),
+                 lambda _: self.refresh_auth())
+
+    def install(self):
+        try:
+            open_in_terminal(install_command())
+        except Exception as e:
+            self.auth_var.set(f"Не удалось запустить установку: {e}")
+            return
+        self.auth_var.set("Идёт установка в отдельном окне… Как только Claude Code "
+                          "появится, здесь станет доступна кнопка входа.")
+        self._install_deadline = time.time() + 900
+        self.top.after(5000, self._poll_install)
+
+    def _poll_install(self):
+        if not self.alive or not self._install_deadline:
+            return
+        if self._exe():
+            self._install_deadline = 0
+            self.refresh_auth()
+        elif time.time() < self._install_deadline:
+            self.top.after(4000, self._poll_install)
+
+    # --- вкладка «Горячие клавиши» ----------------------------------------
+    def _tab_hotkeys(self, f):
+        ttk.Label(f, wraplength=640, foreground="#666", text=(
+            "Нажми «Изменить», затем нужное сочетание. Работают сочетания с Ctrl, Alt "
+            "или Win, а также F1–F24. Пока открыто окно настроек, горячие клавиши "
+            "отключены.")).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        self.hk_vars = {}
+        for i, (action, name) in enumerate(ACTION_NAMES, start=1):
+            ttk.Label(f, text=name).grid(row=i, column=0, sticky="w", pady=3)
+            v = tk.StringVar(value=pretty_combo(self.cfg["hotkeys"].get(action, "")))
+            self.hk_vars[action] = v
+            ttk.Label(f, textvariable=v, width=20, anchor="center", relief="groove",
+                      padding=(4, 3)).grid(row=i, column=1, padx=8)
+            ttk.Button(f, text="Изменить",
+                       command=lambda a=action: self.start_capture(a)).grid(row=i, column=2)
+            ttk.Button(f, text="✕", width=3,
+                       command=lambda a=action: self.set_hotkey(a, "")).grid(row=i, column=3,
+                                                                             padx=(4, 0))
+        n = len(ACTION_NAMES) + 1
+        self.hk_msg = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.hk_msg, foreground="#b3261e", wraplength=640).grid(
+            row=n, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Button(f, text="Вернуть по умолчанию", command=self.reset_hotkeys).grid(
+            row=n + 1, column=0, sticky="w", pady=(8, 0))
+        f.columnconfigure(0, weight=1)
+
+    def start_capture(self, action):
+        if self.capturing:
+            self.hk_vars[self.capturing].set(pretty_combo(self.cfg["hotkeys"].get(self.capturing)))
+        self.capturing = action
+        self.mods = set()
+        self.hk_vars[action].set("нажми сочетание… (Esc — отмена)")
+        self.hk_msg.set("")
+        self.top.focus_force()
+
+    def _key_press(self, e):
+        if not self.capturing:
+            return None
+        ks = e.keysym
+        if ks in _MOD_KEYSYMS:
+            if _MOD_KEYSYMS[ks]:
+                self.mods.add(_MOD_KEYSYMS[ks])
+            return "break"
+        action = self.capturing
+        if ks == "Escape":
+            self.capturing = None
+            self.hk_vars[action].set(pretty_combo(self.cfg["hotkeys"].get(action)))
+            return "break"
+        key = key_name_from_event(e)
+        if not key:
+            self.hk_msg.set(f"Клавишу «{ks}» назначить нельзя — выбери другую.")
+            return "break"
+        # Ctrl/Alt/Shift берём из состояния клавиатуры в момент нажатия (не залипают),
+        # Win — из отслеживания нажатий (в state его нет)
+        mods = mods_from_state(e.state) | ({"win"} & self.mods)
+        if not ({"ctrl", "alt", "win"} & mods) and not re.fullmatch(r"f\d+", key):
+            self.hk_msg.set("Добавь Ctrl, Alt или Win — иначе клавиша будет мешать обычному "
+                            "набору текста. Без модификаторов можно только F1–F24.")
+            return "break"
+        combo = "+".join([m for m in ("ctrl", "alt", "shift", "win") if m in mods] + [key])
+        for other, name in ACTION_NAMES:
+            if other != action and self.cfg["hotkeys"].get(other) == combo:
+                self.hk_msg.set(f"{pretty_combo(combo)} уже назначено: «{name}».")
+                return "break"
+        self.set_hotkey(action, combo)
+        return "break"
+
+    def _key_release(self, e):
+        m = _MOD_KEYSYMS.get(e.keysym)
+        if m:
+            self.mods.discard(m)
+
+    def set_hotkey(self, action, combo):
+        self.cfg["hotkeys"][action] = combo
+        self.hk_vars[action].set(pretty_combo(combo))
+        if self.capturing == action:
+            self.capturing = None
+        self.hk_msg.set("")
+
+    def reset_hotkeys(self):
+        self.capturing = None
+        for action, _ in ACTION_NAMES:
+            self.set_hotkey(action, DEFAULT_CONFIG["hotkeys"][action])
+
+    # --- вкладка «Панель» -------------------------------------------------
+    def _spin(self, f, row, text, var, lo, hi, step=1, hint=""):
+        ttk.Label(f, text=text).grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Spinbox(f, from_=lo, to=hi, increment=step, textvariable=var, width=8).grid(
+            row=row, column=1, sticky="w", padx=8)
+        if hint:
+            ttk.Label(f, text=hint, foreground="#777").grid(row=row, column=2, sticky="w")
+
+    def _tab_overlay(self, f):
+        o = self.cfg["overlay"]
+        self.ov = {
+            "width": tk.IntVar(value=o["width"]),
+            "max_height": tk.IntVar(value=o["max_height"]),
+            "font_size": tk.IntVar(value=o["font_size"]),
+            "opacity": tk.DoubleVar(value=o["opacity"]),
+            "auto_hide_seconds": tk.IntVar(value=o["auto_hide_seconds"]),
+            "corner": tk.StringVar(value=dict(CORNERS).get(o.get("corner"), CORNERS[0][1])),
+        }
+        self._spin(f, 0, "Ширина, px", self.ov["width"], 250, 1600, 10)
+        self._spin(f, 1, "Макс. высота, px", self.ov["max_height"], 100, 1400, 10)
+        self._spin(f, 2, "Размер шрифта", self.ov["font_size"], 8, 28)
+        ttk.Label(f, text="Непрозрачность").grid(row=3, column=0, sticky="w", pady=4)
+        op_lbl = ttk.Label(f, text=f"{int(o['opacity'] * 100)}%")
+        ttk.Scale(f, from_=0.3, to=1.0, variable=self.ov["opacity"], length=160,
+                  command=lambda v: op_lbl.configure(text=f"{int(float(v) * 100)}%")).grid(
+            row=3, column=1, sticky="w", padx=8)
+        op_lbl.grid(row=3, column=2, sticky="w")
+        ttk.Label(f, text="Угол экрана").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Combobox(f, textvariable=self.ov["corner"], state="readonly", width=16,
+                     values=[c[1] for c in CORNERS]).grid(row=4, column=1, columnspan=2,
+                                                          sticky="w", padx=8)
+        self._spin(f, 5, "Прятать через, сек", self.ov["auto_hide_seconds"], 0, 600, 5,
+                   "0 — не прятать")
+        row = ttk.Frame(f)
+        row.grid(row=6, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        ttk.Button(row, text="Предпросмотр", command=self.preview).pack(side="left")
+        ttk.Button(row, text="Вернуть панель в угол", command=self.reset_pos).pack(side="left",
+                                                                                   padx=6)
+        ttk.Label(f, wraplength=640, foreground="#666", text=(
+            "Если панель перетаскивали, она остаётся на новом месте. Чтобы снова "
+            "привязать её к углу, нажми «Вернуть панель в угол».")).grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+    def preview(self):
+        err = self._collect()
+        if err:
+            messagebox.showerror("Настройки", err, parent=self.top)
+            return
+        ov = self.app.overlay
+        ov.apply_config(self.cfg)
+        ov.show()
+        ov.set_status("предпросмотр")
+        ov.set_text("Так будет выглядеть ответ.\n\n• Пункт первый\n• Пункт второй\n\n"
+                    "x² + 2x + 1 = (x + 1)²")
+
+    def reset_pos(self):
+        self.app.state["overlay_pos"] = None
+        self.app.save_state()
+        self.preview()
+
+    # --- вкладка «Claude» -------------------------------------------------
+    def _tab_claude(self, f):
+        ttk.Label(f, text="Модель").grid(row=0, column=0, sticky="w", pady=4)
+        self.model_var = tk.StringVar(value=self.cfg.get("model") or MODEL_LABEL_DEFAULT)
+        ttk.Combobox(f, textvariable=self.model_var, values=MODELS, state="readonly",
+                     width=16).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(f, text="sonnet — быстрее, opus — умнее", foreground="#777").grid(
+            row=0, column=2, sticky="w")
+        self.side_var = tk.IntVar(value=self.cfg.get("max_image_side", 1600))
+        self._spin(f, 1, "Размер скриншота, px", self.side_var, 600, 3000, 100,
+                   "по длинной стороне")
+        ttk.Label(f, text="Текст к скриншоту по горячей клавише:").grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        self.prompt_txt = tk.Text(f, height=4, wrap="word", relief="solid", bd=1,
+                                  font=("Segoe UI" if IS_WIN else "Helvetica", 10))
+        self.prompt_txt.insert("1.0", self.cfg.get("screenshot_prompt", ""))
+        self.prompt_txt.grid(row=3, column=0, columnspan=3, sticky="ew")
+        ttk.Label(f, text="Путь к Claude Code (если не находится сам):").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(12, 2))
+        self.path_var = tk.StringVar(value=self.cfg.get("claude_path", ""))
+        prow = ttk.Frame(f)
+        prow.grid(row=5, column=0, columnspan=3, sticky="ew")
+        ttk.Entry(prow, textvariable=self.path_var).pack(side="left", fill="x", expand=True)
+        ttk.Button(prow, text="Обзор…", command=self._browse).pack(side="left", padx=(6, 0))
+        ttk.Button(f, text="Открыть постоянные инструкции (CLAUDE.md)",
+                   command=lambda: open_path(WORK / "CLAUDE.md")).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        ttk.Label(f, wraplength=640, foreground="#666", text=(
+            "В CLAUDE.md — то, что Claude учитывает в каждом ответе: язык, стиль, "
+            "краткость. Изменения действуют с нового диалога.")).grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        f.columnconfigure(2, weight=1)
+
+    def _browse(self):
+        p = filedialog.askopenfilename(parent=self.top, title="Где находится claude",
+                                       filetypes=[("claude", "claude*"), ("Все файлы", "*")])
+        if p:
+            self.path_var.set(p)
+
+    # --- сохранение -------------------------------------------------------
+    def _collect(self):
+        def num(var, lo, hi, name, cast=int):
+            try:
+                v = cast(var.get())
+            except (tk.TclError, ValueError):
+                raise ValueError(f"«{name}»: нужно число")
+            return max(lo, min(hi, v))
+        try:
+            o = self.cfg["overlay"]
+            o["width"] = num(self.ov["width"], 250, 1600, "Ширина")
+            o["max_height"] = num(self.ov["max_height"], 100, 1400, "Макс. высота")
+            o["font_size"] = num(self.ov["font_size"], 8, 28, "Размер шрифта")
+            o["opacity"] = round(num(self.ov["opacity"], 0.3, 1.0, "Непрозрачность", float), 2)
+            o["auto_hide_seconds"] = num(self.ov["auto_hide_seconds"], 0, 600, "Прятать через")
+            o["corner"] = {v: k for k, v in CORNERS}.get(self.ov["corner"].get(), "top-right")
+            self.cfg["max_image_side"] = num(self.side_var, 600, 3000, "Размер скриншота")
+        except ValueError as e:
+            return str(e)
+        m = self.model_var.get()
+        self.cfg["model"] = "" if m == MODEL_LABEL_DEFAULT else m
+        self.cfg["screenshot_prompt"] = (self.prompt_txt.get("1.0", "end-1c").strip()
+                                         or DEFAULT_CONFIG["screenshot_prompt"])
+        self.cfg["claude_path"] = self.path_var.get().strip()
+        return None
+
+    def save(self):
+        err = self._collect()
+        if err:
+            messagebox.showerror("Настройки", err, parent=self.top)
+            return
+        self.app.apply_settings(self.cfg)
+        self._close()
+
+    def cancel(self):
+        self.app.overlay.apply_config(self.app.cfg)  # откатить предпросмотр
+        self._close()
+
+    def _close(self):
+        self.alive = False
+        self.capturing = None
+        self.top.destroy()
+        self.app.settings = None
+        self.app.start_hotkeys()
+
+
+def open_path(path):
+    try:
+        if IS_WIN:
+            os.startfile(str(path))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не открыть {path}: {e}")
+
+
+# ----------------------------------------------------------------------------
 # Главное окно (чат)
 # ----------------------------------------------------------------------------
 class App:
@@ -689,6 +1300,8 @@ class App:
         self.to_overlay = False
         self.attachments = []
         self._render_job = None
+        self.settings = None
+        self.hotkeys = None
 
         if IS_WIN:
             try:
@@ -708,9 +1321,7 @@ class App:
 
         self.overlay = Overlay(root, self.cfg, self.state, self.save_state)
 
-        hk = self.cfg["hotkeys"]
-        self.hotkeys = WinHotkeys(hk, self.q.put) if IS_WIN else PynputHotkeys(hk, self.q.put)
-        self.hotkeys.start()
+        self.start_hotkeys()
 
         for item in self.state["history"]:
             self._append(item["role"], item["text"])
@@ -724,13 +1335,14 @@ class App:
         top = ttk.Frame(r, padding=(8, 6))
         top.pack(fill="x")
         ttk.Label(top, text="Модель:").pack(side="left")
-        self.model_var = tk.StringVar(value=self.cfg.get("model") or "по умолчанию")
+        self.model_var = tk.StringVar(value=self.cfg.get("model") or MODEL_LABEL_DEFAULT)
         cb = ttk.Combobox(top, textvariable=self.model_var, width=13, state="readonly",
-                          values=["по умолчанию", "sonnet", "opus", "haiku", "fable"])
+                          values=MODELS)
         cb.pack(side="left", padx=(4, 10))
         cb.bind("<<ComboboxSelected>>", self._model_changed)
         ttk.Button(top, text="Новый диалог", command=self.new_dialog).pack(side="left")
         ttk.Button(top, text="Папка", command=self._open_folder).pack(side="left", padx=4)
+        ttk.Button(top, text="⚙ Настройки", command=self.open_settings).pack(side="left")
         self.status_var = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.status_var, foreground="#777").pack(side="right")
 
@@ -763,21 +1375,53 @@ class App:
         ttk.Button(btns, text="📷 + скрин", command=lambda: self.send_chat(True)).pack(fill="x")
         ttk.Button(btns, text="■ Стоп", command=self.stop).pack(fill="x", pady=(2, 0))
 
-        hk = self.cfg["hotkeys"]
-        pretty = {"pageup": "PgUp", "pagedown": "PgDn"}
-
-        def f(k):
-            return "+".join(pretty.get(p, p.capitalize() if len(p) > 1 else p.upper())
-                            for p in hk[k].lower().replace(" ", "").split("+"))
-        help_text = (f"{f('shot')} — скрин экрана · {f('region')} — скрин области · "
-                     f"{f('toggle')} — скрыть/показать панель · {f('scroll_up')}/{f('scroll_down')} — "
-                     f"прокрутка · {f('move')} — двигать панель · {f('chat')} — этот чат · "
-                     f"{f('stop')} — стоп.   Enter — отправить, Shift+Enter — новая строка.")
-        ttk.Label(r, text=help_text, wraplength=600, foreground="#777",
-                  padding=(8, 0, 8, 8), font=(fam, 8)).pack(side="bottom", fill="x")
+        self.help_label = ttk.Label(r, text=self._help_text(), wraplength=600, foreground="#777",
+                                    padding=(8, 0, 8, 8), font=(fam, 8))
+        self.help_label.pack(side="bottom", fill="x")
         bot.pack(side="bottom", fill="x")
         att.pack(side="bottom", fill="x")
         mid.pack(fill="both", expand=True)
+
+    def _help_text(self):
+        hk = self.cfg["hotkeys"]
+        short = {"shot": "скрин экрана", "region": "скрин области", "toggle": "скрыть/показать панель",
+                 "scroll_up": "прокрутка вверх", "scroll_down": "прокрутка вниз",
+                 "move": "двигать панель", "chat": "этот чат", "stop": "стоп"}
+        items = [f"{pretty_combo(hk[a])} — {short[a]}" for a, _ in ACTION_NAMES if hk.get(a)]
+        return " · ".join(items) + ".   Enter — отправить, Shift+Enter — новая строка."
+
+    # --- настройки и горячие клавиши -------------------------------------
+    def open_settings(self, tab="account"):
+        if self.settings and self.settings.alive:
+            self.settings.lift(tab)
+        else:
+            self.settings = SettingsWindow(self, tab)
+
+    def apply_settings(self, cfg):
+        self.cfg = cfg
+        save_json(CONFIG_PATH, cfg)
+        self.overlay.apply_config(cfg)
+        self.model_var.set(cfg.get("model") or MODEL_LABEL_DEFAULT)
+        self.help_label.configure(text=self._help_text())
+
+    def start_hotkeys(self):
+        self.stop_hotkeys()
+        hk = self.cfg["hotkeys"]
+        self.hotkeys = WinHotkeys(hk, self.q.put) if IS_WIN else PynputHotkeys(hk, self.q.put)
+        self.hotkeys.start()
+
+    def stop_hotkeys(self):
+        if self.hotkeys:
+            try:
+                self.hotkeys.stop()
+            except Exception:
+                pass
+            self.hotkeys = None
+
+    def on_auth(self, logged, desc):
+        if logged and not getattr(self, "_logged_in", False):
+            self._logged_in = True
+            self._sys(desc.splitlines()[0])
 
     def _readonly_keys(self, e):
         if (e.state & 0x4) and e.keysym.lower() in ("c", "a", "insert"):
@@ -794,19 +1438,11 @@ class App:
 
     def _model_changed(self, _=None):
         v = self.model_var.get()
-        self.cfg["model"] = "" if v == "по умолчанию" else v
+        self.cfg["model"] = "" if v == MODEL_LABEL_DEFAULT else v
         save_json(CONFIG_PATH, self.cfg)
 
     def _open_folder(self):
-        try:
-            if IS_WIN:
-                os.startfile(str(WORK))
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(WORK)])
-            else:
-                subprocess.Popen(["xdg-open", str(WORK)])
-        except Exception as e:
-            self._sys(f"Не открыть папку: {e}")
+        open_path(WORK)
 
     # --- журнал чата -----------------------------------------------------
     def _append(self, role, text):
@@ -904,7 +1540,7 @@ class App:
     def hotkey_shot(self, region):
         if self.busy:
             self.overlay.show()
-            self.overlay.set_status(f"ещё отвечаю… ({self.cfg['hotkeys']['stop']} — стоп)")
+            self.overlay.set_status(f"ещё отвечаю… ({pretty_combo(self.cfg['hotkeys']['stop'])} — стоп)")
             return
         prompt = self.cfg["screenshot_prompt"]
         self.capture(lambda img: self.start_request(
@@ -946,7 +1582,8 @@ class App:
     def start_request(self, content, shown, to_overlay):
         exe = find_claude(self.cfg.get("claude_path", ""))
         if not exe:
-            self._sys("Не найден Claude Code. Установи его и войди по подписке — см. README.")
+            self._sys("⚠ Claude Code не найден. Установи его: ⚙ Настройки → Аккаунт.")
+            self.open_settings("account")
             return
         self.busy = True
         self.cur_text = ""
@@ -1000,10 +1637,20 @@ class App:
             return
         if kind == "hotkey_fail":
             self._sys("Не удалось назначить горячие клавиши: " + "; ".join(ev[1])
-                      + ". Поменяй их в config.json и перезапусти.")
+                      + ". Поменяй их: ⚙ Настройки → Горячие клавиши.")
             return
-        if kind == "version":
-            self.status_var.set(ev[1])
+        if kind == "auth":
+            _, exe, version, logged, desc = ev
+            self.status_var.set(version)
+            if not exe:
+                self._sys("⚠ Claude Code не найден. Установи его: ⚙ Настройки → Аккаунт → "
+                          "«Установить Claude Code».")
+                self.open_settings("account")
+            elif not logged:
+                self._sys("⚠ Нужно войти в аккаунт Claude: ⚙ Настройки → Аккаунт → «Войти».")
+                self.open_settings("account")
+            else:
+                self.on_auth(True, desc)
             return
         rid = ev[1]
         if rid != self.rid:
@@ -1062,8 +1709,10 @@ class App:
             self.save_state()
             return "⚠ Старая сессия не найдена — начат новый диалог. Повтори запрос."
         if any(k in low for k in ("login", "log in", "/login", "authenticat", "oauth", "invalid api key")):
-            return ("⚠ Claude Code не авторизован. Открой терминал, запусти `claude` "
-                    "и войди своим аккаунтом с подпиской (Pro/Max).\n\n" + t)
+            self._logged_in = False
+            self.root.after(100, lambda: self.open_settings("account"))
+            return ("⚠ Не выполнен вход в аккаунт Claude. Открой ⚙ Настройки → Аккаунт → "
+                    "«Войти в аккаунт Claude».\n\n" + t)
         if "limit" in low:
             return "⚠ Похоже, исчерпан лимит подписки на текущее окно.\n\n" + t
         return "⚠ " + (t or "Неизвестная ошибка")
@@ -1094,20 +1743,15 @@ class App:
             self.input.focus_set()
 
     def _check_claude(self):
-        exe = find_claude(self.cfg.get("claude_path", ""))
-        if not exe:
-            self._sys("⚠ Не найден Claude Code. Установи его (см. README), запусти в терминале "
-                      "`claude` и войди аккаунтом с подпиской. Потом перезапусти это приложение.")
-            return
+        path = self.cfg.get("claude_path", "")
 
-        def ver():
-            try:
-                out = subprocess.run([exe, "--version"], capture_output=True, timeout=30,
-                                     creationflags=0x08000000 if IS_WIN else 0)
-                self.q.put(("version", out.stdout.decode("utf-8", "replace").strip()[:40]))
-            except Exception:
-                pass
-        threading.Thread(target=ver, daemon=True).start()
+        def check():
+            exe = find_claude(path)
+            if not exe:
+                self.q.put(("auth", None, "", False, ""))
+                return
+            self.q.put(("auth", exe, claude_version(exe)) + auth_status(exe))
+        threading.Thread(target=check, daemon=True).start()
         if not self.state["history"]:
             self._sys("Готово. Напиши здесь, что нужно делать со скриншотами, и прикрепи файлы, "
                       "если нужны. Потом сверни окно и жми горячую клавишу.")
@@ -1115,7 +1759,7 @@ class App:
     def quit(self):
         try:
             self.runner.stop()
-            self.hotkeys.stop()
+            self.stop_hotkeys()
         finally:
             self.save_state()
             self.root.destroy()
