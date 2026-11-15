@@ -31,7 +31,7 @@ from core import (
     mtime, open_in_terminal, open_path, pretty_combo, release_chat, resolve_error,
     running_pid, save_json, send_command, set_active_chat, set_dpi_aware,
     set_hotkeys_paused, take_commands, update_chat, update_state, write_pid,
-    THEME_LABELS, monitor_choices,
+    THEME_LABELS, monitor_choices, DISPLAY_MODES, ScreenMarks, pick_monitor,
 )
 
 FAM = "Segoe UI" if IS_WIN else "Helvetica"
@@ -53,7 +53,7 @@ class SettingsWindow:
 
         t = self.top = tk.Toplevel(app.root)
         t.title("Настройки")
-        t.geometry("780x600")
+        t.geometry("800x720")
         t.minsize(600, 500)
         t.transient(app.root)
         t.protocol("WM_DELETE_WINDOW", self.cancel)
@@ -81,8 +81,9 @@ class SettingsWindow:
         self._live_job = None
         for v in self.ov.values():
             v.trace_add("write", self._live)
-        for v in self.pos.values():
-            v.trace_add("write", self._pos_changed)
+        for k, v in self.pos.items():
+            v.trace_add("write", self._live if k in ("display_mode", "marks_seconds")
+                        else self._pos_changed)
         self.refresh_auth()
         self._ready = True
 
@@ -367,15 +368,36 @@ class SettingsWindow:
             "offset_x": tk.IntVar(value=o.get("offset_x", 24)),
             "offset_y": tk.IntVar(value=o.get("offset_y", 24)),
             "respect_taskbar": tk.BooleanVar(value=o.get("respect_taskbar", True)),
+            "display_mode": tk.StringVar(value=o.get("display_mode", "panel")),
+            "marks_seconds": tk.IntVar(value=o.get("marks_seconds", 0)),
         }
-        ttk.Label(f, text="Монитор").grid(row=0, column=0, sticky="w", pady=4)
+        mf = ttk.LabelFrame(f, text="Как показывать ответ", padding=(10, 6))
+        mf.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        for val, title in DISPLAY_MODES:
+            ttk.Radiobutton(mf, text=title, value=val,
+                            variable=self.pos["display_mode"]).pack(anchor="w")
+        ttk.Label(mf, wraplength=680, foreground="#666", text=(
+            "Пометки: Claude обводит нужные места рамками с номерами и пишет короткие подписи "
+            "рядом — ответы у вопросов, «нажми сюда» у кнопок, ошибки в строках. Точность — "
+            "до нескольких десятков пикселей, лучше всего со скриншотом области. Панель ниже "
+            "тогда показывает только «думаю…» и ответ текстом, если пометки не получились. "
+            "Скрыть/показать пометки — та же клавиша, что и панель.")).pack(anchor="w", pady=(4, 0))
+        sr = ttk.Frame(mf)
+        sr.pack(anchor="w", pady=(6, 0))
+        ttk.Label(sr, text="Убирать пометки через, сек").pack(side="left")
+        ttk.Spinbox(sr, from_=0, to=600, increment=5, width=6,
+                    textvariable=self.pos["marks_seconds"]).pack(side="left", padx=8)
+        ttk.Label(sr, text="0 — пока не скрыть клавишей", foreground="#777").pack(side="left")
+        ttk.Label(f, text="Панель с текстом", font=(FAM, 10, "bold")).grid(
+            row=1, column=0, columnspan=3, sticky="w")
+        ttk.Label(f, text="Монитор").grid(row=3, column=0, sticky="w", pady=4)
         ttk.Combobox(f, textvariable=self.pos["monitor"], state="readonly", width=34,
-                     values=[m[1] for m in self.monitors]).grid(row=0, column=1, columnspan=2,
+                     values=[m[1] for m in self.monitors]).grid(row=3, column=1, columnspan=2,
                                                                sticky="w", padx=8)
 
-        ttk.Label(f, text="Где на экране").grid(row=1, column=0, sticky="nw", pady=(10, 4))
+        ttk.Label(f, text="Где на экране").grid(row=4, column=0, sticky="nw", pady=(10, 4))
         screen = tk.Frame(f, bg="#9a958d", padx=3, pady=3)
-        screen.grid(row=1, column=1, sticky="w", padx=8, pady=(10, 4))
+        screen.grid(row=4, column=1, sticky="w", padx=8, pady=(10, 4))
         inner = tk.Frame(screen, bg="#e9e6e0")
         inner.pack()
         for i, (val, arrow, _) in enumerate(ANCHORS):
@@ -384,26 +406,26 @@ class SettingsWindow:
                            bg="#e9e6e0", activebackground="#f3d9cc", selectcolor="#d97757",
                            bd=1, cursor="hand2").grid(row=i // 3, column=i % 3, padx=2, pady=2)
         self.anchor_lbl = ttk.Label(f, text="", foreground="#555")
-        self.anchor_lbl.grid(row=1, column=2, sticky="w")
+        self.anchor_lbl.grid(row=4, column=2, sticky="w")
 
-        self._spin(f, 2, "Отступ по горизонтали, px", self.pos["offset_x"], -4000, 4000, 4,
+        self._spin(f, 5, "Отступ по горизонтали, px", self.pos["offset_x"], -4000, 4000, 4,
                    "от края; при центре — сдвиг вправо")
-        self._spin(f, 3, "Отступ по вертикали, px", self.pos["offset_y"], -4000, 4000, 4,
+        self._spin(f, 6, "Отступ по вертикали, px", self.pos["offset_y"], -4000, 4000, 4,
                    "от края; при центре — сдвиг вниз")
         cb = ttk.Checkbutton(f, text="Не заходить на панель задач",
                              variable=self.pos["respect_taskbar"])
-        cb.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        cb.grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
         if not IS_WIN:
             cb.state(["disabled"])
 
         self.drag_var = tk.StringVar(value="")
         drow = ttk.Frame(f)
-        drow.grid(row=5, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        drow.grid(row=8, column=0, columnspan=3, sticky="w", pady=(14, 0))
         ttk.Label(drow, textvariable=self.drag_var, wraplength=480, foreground="#666").pack(
             side="left")
         self.drag_btn = ttk.Button(drow, text="Вернуть к привязке", command=self.reset_pos)
         ttk.Button(f, text="Предпросмотр", command=self.preview).grid(
-            row=6, column=0, sticky="w", pady=(14, 0))
+            row=9, column=0, sticky="w", pady=(14, 0))
         f.columnconfigure(2, weight=1)
         self.reset_drag = False
         self._update_drag_note()
@@ -449,9 +471,15 @@ class SettingsWindow:
             self.app.panel_state["overlay_pos"] = None
         ov.apply_config(self.cfg)
         ov.show()
-        ov.set_status("предпросмотр")
-        ov.set_text("Так будет выглядеть ответ.\n\n• Пункт первый\n• Пункт второй\n\n"
-                    "x² + 2x + 1 = (x + 1)²")
+        if self.cfg["overlay"].get("display_mode") == "screen":
+            ov.set_status("предпросмотр · пометки на экране")
+            ov.set_text("")
+            self.app.preview_marks(self.cfg)
+        else:
+            self.app.hide_preview_marks()
+            ov.set_status("предпросмотр")
+            ov.set_text("Так будет выглядеть ответ.\n\n• Пункт первый\n• Пункт второй\n\n"
+                        "x² + 2x + 1 = (x + 1)²")
 
     def reset_pos(self):
         self.reset_drag = True
@@ -519,6 +547,8 @@ class SettingsWindow:
             o["offset_x"] = num(self.pos["offset_x"], -4000, 4000, "Отступ по горизонтали")
             o["offset_y"] = num(self.pos["offset_y"], -4000, 4000, "Отступ по вертикали")
             o["respect_taskbar"] = bool(self.pos["respect_taskbar"].get())
+            o["display_mode"] = self.pos["display_mode"].get() or "panel"
+            o["marks_seconds"] = num(self.pos["marks_seconds"], 0, 600, "Убирать пометки через")
             self.cfg["max_image_side"] = num(self.side_var, 600, 3000, "Размер скриншота")
         except ValueError as e:
             return str(e)
@@ -578,6 +608,7 @@ class Manager:
         self.settings = None
         self._render_job = None
         self._preview = None
+        self._preview_marks = None
         self.panel_state = load_state()
         self._logged_in = False
 
@@ -1057,6 +1088,28 @@ class Manager:
     def hide_preview(self):
         if self._preview is not None:
             self._preview.hide()
+        self.hide_preview_marks()
+
+    def preview_marks(self, cfg):
+        """Пример пометок в центре выбранного монитора."""
+        if self._preview_marks is None:
+            self._preview_marks = ScreenMarks(self.root, cfg)
+        pm = self._preview_marks
+        pm.apply_config(cfg)
+        try:
+            mon = pick_monitor(cfg["overlay"].get("monitor", "cursor"), self.root.winfo_pointerxy())
+        except tk.TclError:
+            mon = pick_monitor("primary")
+        cx, cy = mon["width"] // 2, mon["height"] // 2
+        demo = {"summary": "Пример: так будут выглядеть пометки",
+                "marks": [{"box": [cx - 260, cy - 90, cx - 40, cy - 40], "text": "Ответ: 42"},
+                          {"box": [cx - 260, cy + 20, cx + 60, cy + 70],
+                           "text": "Здесь ошибка: знак минус вместо плюса"}]}
+        pm.draw(demo, {"ox": mon["left"], "oy": mon["top"], "scale": 1.0, "area": mon})
+
+    def hide_preview_marks(self):
+        if self._preview_marks is not None:
+            self._preview_marks.clear()
 
     def on_auth(self, logged, desc):
         if logged and not self._logged_in:

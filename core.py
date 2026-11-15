@@ -63,6 +63,8 @@ DEFAULT_CONFIG = {
         "offset_x": 24,            # отступ от края по горизонтали, px
         "offset_y": 24,            # отступ от края по вертикали, px
         "respect_taskbar": True,   # не заходить на панель задач
+        "display_mode": "panel",   # panel — текстом в панели, screen — пометками по экрану
+        "marks_seconds": 0,        # через сколько секунд убирать пометки (0 — по клавише)
         "auto_hide_seconds": 0,    # 0 = не прятать автоматически
     },
     "hotkeys": {
@@ -815,20 +817,7 @@ class Overlay:
         self.root.after(3000, self._keep_on_top)
 
     def _apply_click_through(self):
-        if not IS_WIN:
-            return
-        try:
-            u = ctypes.windll.user32
-            hwnd = u.GetParent(self.win.winfo_id()) or self.win.winfo_id()
-            style = u.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-            style |= 0x80000 | 0x80 | 0x08000000  # LAYERED | TOOLWINDOW | NOACTIVATE
-            if self.move_mode:
-                style &= ~0x20
-            else:
-                style |= 0x20  # TRANSPARENT: клики проходят насквозь
-            u.SetWindowLongW(hwnd, -20, style)
-        except Exception:
-            pass
+        make_click_through(self.win, enable=not self.move_mode)
 
     # --- содержимое ------------------------------------------------------
     def set_status(self, s):
@@ -994,7 +983,9 @@ class RegionSelector:
         if box[2] - box[0] < 8 or box[3] - box[1] < 8:
             self._close(None)
             return
-        self._close(self.img.crop(box))
+        crop = self.img.crop(box)
+        crop.info["origin"] = (box[0], box[1])  # где область лежит на мониторе
+        self._close(crop)
 
     def _close(self, crop):
         try:
@@ -1397,3 +1388,231 @@ def resolve_error(text):
     if "limit" in low:
         return "⚠ Похоже, исчерпан лимит подписки на текущее окно.\n\n" + t, False
     return "⚠ " + (t or "Неизвестная ошибка"), False
+
+
+# ----------------------------------------------------------------------------
+# Режим «пометки по всему экрану»
+# ----------------------------------------------------------------------------
+DISPLAY_MODES = [("panel", "Текстом в панели"), ("screen", "Пометками по всему экрану")]
+
+SCREEN_PROMPT = """Ответь в режиме «пометки на экране»: ответ будет нарисован поверх экрана \
+рамками и подписями в нужных местах.
+Размер изображения: {w}×{h} пикселей, начало координат — левый верхний угол.
+Верни ТОЛЬКО JSON, без текста до и после:
+{{"summary": "общий ответ одной-двумя фразами (можно пусто)",
+ "marks": [{{"box": [x1, y1, x2, y2], "text": "короткая подпись"}}]}}
+Правила:
+- box — прямоугольник в пикселях ЭТОГО изображения вокруг места, к которому относится \
+подпись: вопрос, вариант ответа, поле, кнопка, строка, ошибка.
+- Одна пометка — одно место, не больше 12 пометок, по порядку чтения.
+- В text — сам ответ или действие (до ~15 слов), без рассуждений.
+- Если показывать на экране нечего — пустой marks и ответ в summary."""
+
+
+def fit_for_vision(img, max_side):
+    """Уменьшить так, чтобы модель видела картинку без дополнительного сжатия.
+    Возвращает (картинка, масштаб = новая ширина / исходная)."""
+    w, h = img.size
+    k = min(1.0, max_side / max(w, h), 1568 / max(w, h), (1_150_000 / (w * h)) ** 0.5)
+    if k >= 1.0:
+        return img.convert("RGB"), 1.0
+    nw, nh = max(1, int(w * k)), max(1, int(h * k))
+    return img.convert("RGB").resize((nw, nh), Image.LANCZOS), nw / w
+
+
+def parse_marks(text):
+    """JSON с пометками из ответа Claude → {'summary', 'marks'} или None."""
+    t = (text or "").strip()
+    start, end = t.find("{"), t.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(t[start:end + 1])
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    marks = []
+    for m in data.get("marks") or []:
+        if not isinstance(m, dict):
+            continue
+        b = m.get("box")
+        p = m.get("point")
+        if isinstance(b, (list, tuple)) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b):
+            x1, y1, x2, y2 = b
+        elif isinstance(p, (list, tuple)) and len(p) == 2 and all(isinstance(v, (int, float)) for v in p):
+            x1, y1, x2, y2 = p[0] - 12, p[1] - 12, p[0] + 12, p[1] + 12
+        else:
+            continue
+        marks.append({"box": [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)],
+                      "text": str(m.get("text") or "").strip()[:300]})
+    return {"summary": str(data.get("summary") or "").strip(), "marks": marks[:20]}
+
+
+def marks_as_text(parsed):
+    lines = [parsed["summary"]] if parsed["summary"] else []
+    lines += [f"{i}. {m['text']}" for i, m in enumerate(parsed["marks"], 1) if m["text"]]
+    return "\n".join(lines) or "(пометок нет)"
+
+
+def make_click_through(win, enable=True):
+    """Окно пропускает клики мыши насквозь (Windows)."""
+    if not IS_WIN:
+        return
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetParent(win.winfo_id()) or win.winfo_id()
+        style = u.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+        style |= 0x80000 | 0x80 | 0x08000000  # LAYERED | TOOLWINDOW | NOACTIVATE
+        style = (style | 0x20) if enable else (style & ~0x20)  # TRANSPARENT
+        u.SetWindowLongW(hwnd, -20, style)
+    except Exception:
+        pass
+
+
+class ScreenMarks:
+    """Рамки с номерами и подписи поверх экрана. Каждая деталь — маленькое окно без рамки,
+    поэтому всё остальное на экране остаётся видимым и кликабельным."""
+
+    EDGE = 3
+
+    def __init__(self, root, cfg):
+        self.root = root
+        self.cfg = cfg["overlay"]
+        self.wins = []
+        self.visible = False
+        self._hide_job = None
+        fam = "Segoe UI" if IS_WIN else "Helvetica"
+        self.font = tkfont.Font(family=fam, size=self.cfg["font_size"])
+        self.badge_font = tkfont.Font(family=fam, size=max(8, self.cfg["font_size"] - 1), weight="bold")
+
+    def apply_config(self, cfg):
+        self.cfg = cfg["overlay"]
+        self.font.configure(size=self.cfg["font_size"])
+        self.badge_font.configure(size=max(8, self.cfg["font_size"] - 1))
+
+    @property
+    def has_marks(self):
+        return bool(self.wins)
+
+    def clear(self):
+        self._cancel_hide()
+        for w in self.wins:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        self.wins = []
+        self.visible = False
+
+    def hide(self):
+        self._cancel_hide()
+        for w in self.wins:
+            w.withdraw()
+        self.visible = False
+
+    def show(self):
+        for w in self.wins:
+            w.deiconify()
+            make_click_through(w)
+        self.visible = bool(self.wins)
+
+    def toggle(self):
+        self.hide() if self.visible else self.show()
+
+    def _cancel_hide(self):
+        if self._hide_job:
+            self.root.after_cancel(self._hide_job)
+            self._hide_job = None
+
+    def _win(self, bg, alpha=1.0):
+        t = tk.Toplevel(self.root)
+        t.withdraw()
+        t.overrideredirect(True)
+        t.attributes("-topmost", True)
+        if alpha < 1.0:
+            t.attributes("-alpha", alpha)
+        t.configure(bg=bg)
+        self.wins.append(t)
+        return t
+
+    def _place(self, t, x, y, w, h):
+        t.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
+
+    def draw(self, parsed, mapping):
+        """mapping: ox, oy — где на экране левый верхний угол скриншота; scale — во сколько
+        раз картинка для Claude меньше снимка; area — монитор, за который не выходить."""
+        self.clear()
+        c = theme_colors(self.cfg.get("theme", "dark"))
+        area = mapping["area"]
+        AL, AT = area["left"], area["top"]
+        AR, AB = AL + area["width"], AT + area["height"]
+        k = mapping["scale"] or 1.0
+        placed = []
+        wrap = max(200, min(420, int(self.cfg.get("width", 460) * 0.8)))
+        alpha = max(0.75, float(self.cfg.get("opacity", 0.85)))
+
+        def label(text, number=None):
+            t = self._win(c["accent"], alpha)
+            fr = tk.Frame(t, bg=c["bg"])
+            fr.pack(padx=2, pady=2)
+            if number is not None:
+                tk.Label(fr, text=str(number), bg=c["accent"], fg="white", font=self.badge_font,
+                         padx=6).pack(side="left", fill="y")
+            tk.Label(fr, text=text, bg=c["bg"], fg=c["fg"], font=self.font, justify="left",
+                     wraplength=wrap, padx=8, pady=4).pack(side="left")
+            t.update_idletasks()
+            return t, t.winfo_reqwidth(), t.winfo_reqheight()
+
+        def fits(x, y, w, h):
+            if x < AL or y < AT or x + w > AR or y + h > AB:
+                return False
+            return all(x + w <= px or px + pw <= x or y + h <= py or py + ph <= y
+                       for px, py, pw, ph in placed)
+
+        boxes = []  # сначала все рамки — подписи не должны их закрывать
+        for i, m in enumerate(parsed["marks"], 1):
+            x1, y1, x2, y2 = m["box"]
+            x1, x2 = mapping["ox"] + x1 / k, mapping["ox"] + x2 / k
+            y1, y2 = mapping["oy"] + y1 / k, mapping["oy"] + y2 / k
+            pad = 4
+            x1, y1 = max(AL, x1 - pad), max(AT, y1 - pad)
+            x2, y2 = min(AR, x2 + pad), min(AB, y2 + pad)
+            if x2 - x1 < 6 or y2 - y1 < 6:
+                continue
+            boxes.append((i, m, x1, y1, x2, y2))
+            placed.append((x1, y1, x2 - x1, y2 - y1))
+
+        for i, m, x1, y1, x2, y2 in boxes:
+            e = self.EDGE
+            for (x, y, w, h) in ((x1, y1, x2 - x1, e), (x1, y2 - e, x2 - x1, e),
+                                 (x1, y1, e, y2 - y1), (x2 - e, y1, e, y2 - y1)):
+                self._place(self._win(c["accent"]), x, y, w, h)
+            t, w, h = label(m["text"] or "•", i)
+            gap = 8
+            for (x, y) in ((x2 + gap, y1), (x1 - gap - w, y1), (x1, y2 + gap), (x1, y1 - gap - h),
+                           (x2 - w, y2 + gap), (x2 + gap, y2 - h)):
+                if fits(x, y, w, h):
+                    break
+            else:  # места нет — ставим как можно ближе, не выходя за экран
+                x = min(max(AL, x2 + gap), AR - w)
+                y = min(max(AT, y1), AB - h)
+            placed.append((x, y, w, h))
+            self._place(t, x, y, w, h)
+
+        if parsed["summary"]:
+            t, w, h = label(parsed["summary"])
+            cx = mapping["ox"] + 16
+            cy = mapping["oy"] + 16
+            for (x, y) in ((cx, cy), (AR - w - 16, AT + 16), (AL + 16, AB - h - 16), (AR - w - 16, AB - h - 16)):
+                if fits(x, y, w, h):
+                    break
+            else:
+                x, y = min(max(AL, cx), AR - w), min(max(AT, cy), AB - h)
+            placed.append((x, y, w, h))
+            self._place(t, x, y, w, h)
+
+        self.show()
+        sec = self.cfg.get("marks_seconds") or 0
+        if sec > 0:
+            self._hide_job = self.root.after(int(sec * 1000), self.hide)

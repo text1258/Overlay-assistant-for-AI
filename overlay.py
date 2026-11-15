@@ -13,7 +13,8 @@ import tkinter as tk
 
 from core import (
     ACTION_NAMES, CONFIG_PATH, STATE_PATH, WHO_NAMES, ClaudeRunner, Overlay, PynputHotkeys,
-    RegionSelector, WinHotkeys, IS_WIN, MANAGER_TITLE, acquire_chat, append_messages,
+    RegionSelector, WinHotkeys, IS_WIN, MANAGER_TITLE, SCREEN_PROMPT, ScreenMarks,
+    acquire_chat, append_messages, fit_for_vision, marks_as_text, parse_marks,
     auth_status, claude_version, clear_pid, ensure_dirs, find_claude, focus_window,
     get_active_chat, grab_screen_at, hotkeys_paused, image_to_block, launch, load_chat,
     load_config, load_state, migrate_old_state, mtime, pretty_combo, release_chat,
@@ -52,6 +53,8 @@ class OverlayApp:
         self.root.withdraw()
         self.root.title("Claude Overlay — оверлей")
         self.panel = Overlay(self.root, self.cfg, self.state, self._moved)
+        self.marks = ScreenMarks(self.root, self.cfg)
+        self.mapping = None  # куда переносить координаты пометок (режим «по экрану»)
 
         self.hotkeys = None
         self.paused = hotkeys_paused()
@@ -85,8 +88,11 @@ class OverlayApp:
         elif action == "region":
             self.shot(region=True)
         elif action == "toggle":
-            self.panel.cancel_hide()
-            self.panel.toggle()
+            if self.marks.has_marks and not self.panel.visible:
+                self.marks.toggle()  # в режиме «по экрану» скрывает/показывает пометки
+            else:
+                self.panel.cancel_hide()
+                self.panel.toggle()
         elif action == "scroll_up":
             self.panel.scroll(-1)
         elif action == "scroll_down":
@@ -151,7 +157,9 @@ class OverlayApp:
         prompt = (chat.get("screenshot_prompt") or "").strip() or self.cfg["screenshot_prompt"]
         self.capturing = True
         was_visible = self.panel.visible
+        marks_visible = self.marks.visible
         self.panel.hide()
+        self.marks.hide()  # старые пометки не должны попасть на снимок
         px, py = self.root.winfo_pointerxy()
 
         def cancel():
@@ -159,12 +167,26 @@ class OverlayApp:
             release_chat(chat["id"])
             if was_visible:
                 self.panel.show()
+            if marks_visible:
+                self.marks.show()
 
-        def send(img):
+        def send(img, mon):
             self.capturing = False
-            content = [{"type": "text", "text": prompt},
-                       image_to_block(img, self.cfg["max_image_side"])]
-            self.start_request(chat, content, "📷 скриншот" + (" области" if region else ""))
+            self.marks.clear()
+            shown = "📷 скриншот" + (" области" if region else "")
+            if self.cfg["overlay"].get("display_mode") == "screen":
+                vis, scale = fit_for_vision(img, self.cfg["max_image_side"])
+                ox, oy = img.info.get("origin", (0, 0))
+                self.mapping = {"ox": mon["left"] + ox, "oy": mon["top"] + oy,
+                                "scale": scale, "area": mon}
+                text = prompt + "\n\n" + SCREEN_PROMPT.format(w=vis.width, h=vis.height)
+                content = [{"type": "text", "text": text}, image_to_block(vis, max(vis.size))]
+                shown += " · пометки на экране"
+            else:
+                self.mapping = None
+                content = [{"type": "text", "text": prompt},
+                           image_to_block(img, self.cfg["max_image_side"])]
+            self.start_request(chat, content, shown)
 
         def grab():
             try:
@@ -174,9 +196,9 @@ class OverlayApp:
                 self.panel.flash(f"Не удалось сделать скриншот: {e}")
                 return
             if region:
-                RegionSelector(self.root, img, mon, send, cancel)
+                RegionSelector(self.root, img, mon, lambda crop: send(crop, mon), cancel)
             else:
-                send(img)
+                send(img, mon)
         self.root.after(200, grab)
 
     def start_request(self, chat, content, shown):
@@ -243,7 +265,9 @@ class OverlayApp:
 
     def _render(self):
         self._render_job = None
-        if self.busy:
+        if self.busy and self.mapping:
+            self.panel.set_status("готовлю пометки…")
+        elif self.busy:
             self.panel.set_text(self.cur_text, scroll_end=True)
             self.panel.set_status("пишу…")
 
@@ -252,9 +276,22 @@ class OverlayApp:
             self.root.after_cancel(self._render_job)
             self._render_job = None
         self.busy = False
-        self.panel.set_text(text)
-        self.panel.set_status("")
-        self.panel.schedule_hide()
+        parsed = parse_marks(text) if self.mapping and not text.startswith(("⚠", "⏹")) else None
+        if parsed and (parsed["marks"] or parsed["summary"]):
+            self.panel.hide()
+            self.panel.set_text("")
+            try:
+                self.marks.draw(parsed, self.mapping)
+            except Exception as e:
+                self.panel.flash(f"Не удалось нарисовать пометки: {e}\n\n{marks_as_text(parsed)}", 20)
+            text = marks_as_text(parsed)
+        else:
+            if self.mapping and not text.startswith(("⚠", "⏹")):
+                text = "(пометки не получились — ответ текстом)\n\n" + text
+            self.panel.set_text(text)
+            self.panel.set_status("")
+            self.panel.schedule_hide()
+        self.mapping = None
         try:
             append_messages(self.chat_id, [{"role": "you", "text": self.shown},
                                            {"role": "claude", "text": text}],
@@ -279,6 +316,7 @@ class OverlayApp:
                 old_hk = dict(self.cfg["hotkeys"])
                 self.cfg = load_config()
                 self.panel.apply_config(self.cfg)
+                self.marks.apply_config(self.cfg)
                 if self.cfg["hotkeys"] != old_hk and not self.paused:
                     self.start_hotkeys()
             m = mtime(STATE_PATH)
