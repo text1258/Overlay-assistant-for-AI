@@ -11,14 +11,17 @@ import sys
 import threading
 import tkinter as tk
 
+from providers import (
+    PROVIDER_SHORT, Runner, build_spec, explain_error, finish_chat, provider_of, provider_ready,
+)
 from core import (
-    ACTION_NAMES, CONFIG_PATH, STATE_PATH, WHO_NAMES, ClaudeRunner, Overlay, PynputHotkeys,
+    ACTION_NAMES, CONFIG_PATH, STATE_PATH, WHO_NAMES, Overlay, PynputHotkeys,
     RegionSelector, WinHotkeys, IS_WIN, MANAGER_TITLE, SCREEN_PROMPT, ScreenMarks,
-    acquire_chat, append_messages, fit_for_vision, marks_as_text, parse_marks, MATH, math_note,
+    acquire_chat, fit_for_vision, marks_as_text, parse_marks, MATH, math_note,
     auth_status, claude_version, clear_pid, ensure_dirs, find_claude, focus_window,
     get_active_chat, grab_screen_at, hotkeys_paused, image_to_block, launch, load_chat,
     load_config, load_state, migrate_old_state, mtime, pretty_combo, release_chat,
-    resolve_error, running_pid, send_command, set_dpi_aware, take_commands, update_state,
+    running_pid, send_command, set_dpi_aware, take_commands, update_state,
     write_pid,
 )
 
@@ -39,7 +42,7 @@ class OverlayApp:
         self.state_mtime = mtime(STATE_PATH)
 
         self.q = queue.Queue()
-        self.runner = ClaudeRunner(self.q.put)
+        self.runner = Runner(self.q.put)
         self.busy = False
         self.capturing = False  # идёт снимок / выделение области
         self.rid = None
@@ -118,8 +121,14 @@ class OverlayApp:
     # --- запуск: проверка Claude Code и входа ------------------------------
     def _startup_check(self):
         path = self.cfg.get("claude_path", "")
+        cfg = self.cfg
+        prov = provider_of(get_active_chat(), cfg)
 
         def check():
+            if prov != "claude":  # другая нейросеть — своя проверка готовности
+                ok, msg = provider_ready(prov, cfg)
+                self.q.put(("auth", "other", "", ok, msg))
+                return
             exe = find_claude(path)
             if not exe:
                 self.q.put(("auth", None, "", False, ""))
@@ -127,9 +136,11 @@ class OverlayApp:
                 self.q.put(("auth", exe, claude_version(exe)) + auth_status(exe))
         threading.Thread(target=check, daemon=True).start()
 
-    def _on_auth(self, exe, logged):
+    def _on_auth(self, exe, logged, desc=""):
         how = f"Открой «Управление» ({self._hk('chat')}) → ⚙ Настройки → Аккаунт."
-        if not exe:
+        if exe == "other" and not logged:
+            self.panel.flash(f"⚠ {desc}\n«Управление» — {self._hk('chat')}.", 15)
+        elif not exe:
             self.panel.flash("⚠ Claude Code не найден. " + how, 15)
         elif not logged:
             self.panel.flash("⚠ Не выполнен вход в аккаунт Claude. " + how, 15)
@@ -139,7 +150,8 @@ class OverlayApp:
                 ("shot", "скриншот"), ("region", "область"), ("toggle", "скрыть панель"))
                 if self.cfg["hotkeys"].get(a))
             paused = "\n(горячие клавиши на паузе, пока открыты настройки)" if self.paused else ""
-            self.panel.flash(f"Оверлей запущен · чат «{chat.get('title')}»\n{hint}{paused}", 6)
+            who = PROVIDER_SHORT[provider_of(chat, self.cfg)]
+            self.panel.flash(f"Оверлей запущен · чат «{chat.get('title')}» · {who}\n{hint}{paused}", 6)
 
     # --- скриншот → Claude ---------------------------------------------------
     def shot(self, region):
@@ -203,12 +215,8 @@ class OverlayApp:
         self.root.after(200, grab)
 
     def start_request(self, chat, content, shown):
-        exe = find_claude(self.cfg.get("claude_path", ""))
-        if not exe:
-            release_chat(chat["id"])
-            self.panel.flash("⚠ Claude Code не найден. Открой «Управление» → ⚙ Настройки → Аккаунт.")
-            return
-        fresh = load_chat(chat["id"]) or chat  # session_id мог обновиться в «Управлении»
+        fresh = load_chat(chat["id"]) or chat  # сессия могла обновиться в «Управлении»
+        provider = provider_of(fresh, self.cfg)
         self.busy = True
         self.chat_id = chat["id"]
         self.session_id = None
@@ -217,9 +225,9 @@ class OverlayApp:
         self.panel.cancel_hide()
         self.panel.show()
         self.panel.set_text("")
-        self.panel.set_status(f"думаю… · {chat.get('title')}")
-        self.rid = self.runner.start(exe, content, fresh.get("session_id"),
-                                     self.cfg.get("model"), self.cfg.get("effort", ""))
+        self.panel.set_status(f"думаю… · {chat.get('title')} · {PROVIDER_SHORT[provider]}")
+        self.spec = build_spec(provider, fresh, self.cfg, content)
+        self.rid = self.runner.start_spec(self.spec)
 
     # --- события ---------------------------------------------------------------
     def _poll_queue(self):
@@ -240,7 +248,7 @@ class OverlayApp:
                              ". Поменяй их в «Управлении» → ⚙ Настройки.", 12)
             return
         if kind == "auth":
-            self._on_auth(ev[1], ev[3])
+            self._on_auth(ev[1], ev[3], ev[4])
             return
         if ev[1] != self.rid:
             return
@@ -251,19 +259,21 @@ class OverlayApp:
         elif kind == "msg_start":
             if self.cur_text and not self.cur_text.endswith("\n\n"):
                 self.cur_text += "\n\n"
+        elif kind == "reset":
+            self.cur_text = ""
         elif kind == "delta":
             self.cur_text += ev[2]
             if not self._render_job:
                 self._render_job = self.root.after(50, self._render)
-        elif kind == "done":
-            text, sid, is_err = ev[2], ev[3], ev[4]
+        elif kind in ("done", "fail"):
+            if kind == "done":
+                text, sid, is_err = ev[2], ev[3], ev[4]
+            else:
+                text, sid, is_err = ev[2], None, True
             clear = False
             if is_err and not text.startswith("⏹"):
-                text, clear = resolve_error(text)
+                text, clear = explain_error(self.spec["provider"], text)
             self._finish(text or self.cur_text, sid or self.session_id, clear)
-        elif kind == "fail":
-            text, clear = resolve_error(ev[2])
-            self._finish(text, None, clear)
 
     def _render(self):
         self._render_job = None
@@ -295,9 +305,7 @@ class OverlayApp:
             self.panel.schedule_hide()
         self.mapping = None
         try:
-            append_messages(self.chat_id, [{"role": "you", "text": self.shown},
-                                           {"role": "claude", "text": text}],
-                            session_id=sid, clear_session=clear_session)
+            finish_chat(self.chat_id, self.spec, self.shown, text, sid, clear_session)
         finally:
             release_chat(self.chat_id)
 

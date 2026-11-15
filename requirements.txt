@@ -2,3 +2,4 @@ mss>=9
 Pillow>=10
 pynput>=1.7; sys_platform != "win32"
 matplotlib>=3.6
+pypdf>=4

@@ -20,19 +20,24 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image
 
+from providers import (
+    PROVIDERS, PROVIDER_SHORT, Runner, build_spec, explain_error, finish_chat, provider_of,
+    API_PRESETS, GIGACHAT, GIGA_SCOPES, codex_install_command, codex_status, codex_version,
+    explain_http_error, find_codex, get_secret, list_models, set_secret, test_provider,
+)
 from core import (
     ACTION_NAMES, ANCHORS, CHATS, CONFIG_PATH, DEFAULT_CONFIG, DEFAULT_TITLE, FILES, IMAGE_EXT,
     IS_WIN, MANAGER_TITLE, MODELS, MODEL_LABEL_DEFAULT, NO_WINDOW, WHO_NAMES, WORK,
-    _MOD_KEYSYMS, ClaudeRunner, Overlay, acquire_chat, append_messages, auth_status,
+    _MOD_KEYSYMS, Overlay, acquire_chat, auth_status,
     chat_busy_by, chats_signature, claude_env, claude_version, clear_pid,
     copy_unique, create_chat, delete_chat, docx_to_text, ensure_dirs, find_claude,
     get_active_chat, image_to_block, install_command, key_name_from_event, launch,
     list_chats, load_chat, load_config, load_state, migrate_old_state, mods_from_state,
-    mtime, open_in_terminal, open_path, pretty_combo, release_chat, resolve_error,
+    mtime, open_in_terminal, open_path, pretty_combo, release_chat,
     running_pid, save_json, send_command, set_active_chat, set_dpi_aware,
     set_hotkeys_paused, take_commands, update_chat, update_state, write_pid,
     THEME_LABELS, monitor_choices, DISPLAY_MODES, ScreenMarks, pick_monitor,
-    MATH, MATH_MODES, insert_rich, math_note, EFFORTS, LinkLogin,
+    MATH, MATH_MODES, insert_rich, math_note, EFFORTS, LinkLogin, pdf_to_text,
 )
 
 FAM = "Segoe UI" if IS_WIN else "Helvetica"
@@ -75,7 +80,8 @@ class SettingsWindow:
                                   ("hotkeys", "Горячие клавиши", self._tab_hotkeys),
                                   ("look", "Вид панели", self._tab_look),
                                   ("position", "Положение", self._tab_position),
-                                  ("claude", "Claude", self._tab_claude)):
+                                  ("claude", "Claude", self._tab_claude),
+                                  ("providers", "Нейросети", self._tab_providers)):
             outer, inner = self._scroll_tab(nb)
             nb.add(outer, text=title)
             build(inner)
@@ -643,6 +649,252 @@ class SettingsWindow:
         self._update_drag_note()
         self.preview()
 
+    # --- вкладка «Нейросети» ----------------------------------------------
+    def _tab_providers(self, f):
+        import webbrowser
+        pc = self.cfg.setdefault("providers", json.loads(json.dumps(DEFAULT_CONFIG["providers"])))
+        for k, v in DEFAULT_CONFIG["providers"].items():
+            if isinstance(v, dict):
+                pc.setdefault(k, dict(v))
+        ttk.Label(f, wraplength=680, text=(
+            "Кроме Claude можно подключить другие нейросети. Нейросеть выбирается для каждого "
+            "чата — вверху окна «Управление». Ключи хранятся только на этом компьютере "
+            "(в Windows — в зашифрованном виде).")).pack(anchor="w")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(10, 4))
+        ttk.Label(row, text="Для новых чатов:").pack(side="left")
+        self.def_prov = tk.StringVar(value=dict(PROVIDERS).get(pc.get("default", "claude")))
+        ttk.Combobox(row, textvariable=self.def_prov, values=[t for _, t in PROVIDERS],
+                     state="readonly", width=46).pack(side="left", padx=8)
+
+        # ChatGPT через Codex CLI
+        cf = ttk.LabelFrame(f, text="ChatGPT — через Codex CLI (аккаунт ChatGPT, в т. ч. бесплатный)",
+                            padding=10)
+        cf.pack(fill="x", pady=(10, 0))
+        self.cx_status = tk.StringVar(value="Проверяю…")
+        ttk.Label(cf, textvariable=self.cx_status, wraplength=660).pack(anchor="w")
+        br = ttk.Frame(cf)
+        br.pack(anchor="w", pady=6)
+        self.cx_btns = {}
+        for key, text, cmd in (("install", "Установить", self.codex_install),
+                               ("login", "Войти через браузер", lambda: self.codex_login(False)),
+                               ("device", "Войти по коду", lambda: self.codex_login(True)),
+                               ("logout", "Выйти", self.codex_logout),
+                               ("refresh", "Обновить", self.codex_refresh),
+                               ("test", "Проверить", lambda: self.test_prov("codex"))):
+            b = ttk.Button(br, text=text, command=cmd)
+            b.pack(side="left", padx=(0, 6))
+            self.cx_btns[key] = b
+        mr = ttk.Frame(cf)
+        mr.pack(anchor="w")
+        ttk.Label(mr, text="Модель (пусто — по умолчанию):").pack(side="left")
+        self.cx_model = tk.StringVar(value=pc["codex"].get("model", ""))
+        ttk.Entry(mr, textvariable=self.cx_model, width=26).pack(side="left", padx=6)
+        ttk.Label(cf, wraplength=660, foreground="#666", text=(
+            "«Войти по коду»: в окне терминала появятся ссылка и код — открой ссылку на любом "
+            "устройстве и введи код (сначала включи вход по коду в ChatGPT: Settings → Security). "
+            "Бесплатный план ChatGPT даёт небольшой лимит. Из России сервисы OpenAI доступны "
+            "только через VPN.")).pack(anchor="w", pady=(6, 0))
+
+        # API-нейросети
+        self.api = {}
+        notes = {
+            "gemini": ("Gemini — бесплатный API-ключ Google AI Studio",
+                       "Бесплатно доступны модели Flash, но лимит запросов в день небольшой и "
+                       "меняется. Из России — через VPN."),
+            "openrouter": ("OpenRouter — бесплатные модели по одному ключу",
+                           "Бесплатные модели (с «:free» в названии) — до 50 запросов в день, после "
+                           "разовой покупки кредитов на $10 — до 1000. «Список моделей» показывает "
+                           "только модели, которые видят картинки, бесплатные — первыми."),
+            "ollama": ("Ollama — локально на компьютере, бесплатно и без интернета",
+                       "Установи Ollama и скачай модель, которая видит картинки, например: "
+                       "ollama pull qwen2.5vl:7b (или gemma3). Нужна видеокарта; качество ниже, "
+                       "чем у Claude и ChatGPT."),
+            "gigachat": ("GigaChat — Сбер, работает без VPN",
+                         "Ключ авторизации: developers.sber.ru → GigaChat API → проект → «Ключ "
+                         "авторизации». Физлицам доступен бесплатный режим с лимитом токенов. "
+                         "Если ошибка сертификата — установи «Russian Trusted Root CA» с Госуслуг "
+                         "или укажи файл сертификата."),
+        }
+        for prov in ("gemini", "openrouter", "ollama", "gigachat"):
+            title, note = notes[prov]
+            fr = ttk.LabelFrame(f, text=title, padding=10)
+            fr.pack(fill="x", pady=(10, 0))
+            v = {}
+            url = (API_PRESETS.get(prov) or GIGACHAT)["key_url"]
+            kr = ttk.Frame(fr)
+            kr.pack(fill="x")
+            if prov == "ollama":
+                ttk.Label(kr, text="Адрес сервера:", width=18).pack(side="left")
+                v["base"] = tk.StringVar(value=pc["ollama"].get("base") or API_PRESETS["ollama"]["base"])
+                ttk.Entry(kr, textvariable=v["base"]).pack(side="left", fill="x", expand=True)
+                ttk.Button(kr, text="Скачать Ollama",
+                           command=lambda u=url: webbrowser.open(u)).pack(side="left", padx=(6, 0))
+            else:
+                ttk.Label(kr, text="Ключ авторизации:" if prov == "gigachat" else "API-ключ:",
+                          width=18).pack(side="left")
+                v["key"] = tk.StringVar(value=get_secret(prov))
+                ent = ttk.Entry(kr, textvariable=v["key"], show="•")
+                ent.pack(side="left", fill="x", expand=True)
+                ttk.Button(kr, text="👁", width=3, command=lambda e=ent: e.configure(
+                    show="" if e.cget("show") else "•")).pack(side="left", padx=4)
+                ttk.Button(kr, text="Получить ключ",
+                           command=lambda u=url: webbrowser.open(u)).pack(side="left")
+            mr = ttk.Frame(fr)
+            mr.pack(fill="x", pady=(6, 0))
+            ttk.Label(mr, text="Модель:", width=18).pack(side="left")
+            v["model"] = tk.StringVar(value=pc[prov].get("model") or
+                                      (API_PRESETS.get(prov) or GIGACHAT)["model"])
+            v["cb"] = ttk.Combobox(mr, textvariable=v["model"], values=[v["model"].get()])
+            v["cb"].pack(side="left", fill="x", expand=True)
+            ttk.Button(mr, text="Список моделей",
+                       command=lambda p=prov: self.load_models(p)).pack(side="left", padx=(6, 0))
+            ttk.Button(mr, text="Проверить",
+                       command=lambda p=prov: self.test_prov(p)).pack(side="left", padx=(6, 0))
+            if prov == "gigachat":
+                gr = ttk.Frame(fr)
+                gr.pack(fill="x", pady=(6, 0))
+                ttk.Label(gr, text="Тип доступа:", width=18).pack(side="left")
+                v["scope"] = tk.StringVar(value=pc["gigachat"].get("scope", "GIGACHAT_API_PERS"))
+                ttk.Combobox(gr, textvariable=v["scope"], values=GIGA_SCOPES, state="readonly",
+                             width=22).pack(side="left")
+                ttk.Label(gr, text="  PERS — для физлиц", foreground="#777").pack(side="left")
+                cr = ttk.Frame(fr)
+                cr.pack(fill="x", pady=(6, 0))
+                ttk.Label(cr, text="Файл сертификата:", width=18).pack(side="left")
+                v["ca_file"] = tk.StringVar(value=pc["gigachat"].get("ca_file", ""))
+                ttk.Entry(cr, textvariable=v["ca_file"]).pack(side="left", fill="x", expand=True)
+                ttk.Button(cr, text="Обзор…", command=lambda var=v["ca_file"]: var.set(
+                    filedialog.askopenfilename(parent=self.top, title="Сертификат (.crt / .pem)",
+                                               filetypes=[("Сертификаты", "*.crt *.pem *.cer"),
+                                                          ("Все файлы", "*")]) or var.get())
+                ).pack(side="left", padx=(6, 0))
+            v["status"] = tk.StringVar(value="")
+            ttk.Label(fr, textvariable=v["status"], wraplength=660, foreground="#1f5fbf").pack(
+                anchor="w", pady=(4, 0))
+            ttk.Label(fr, text=note, wraplength=660, foreground="#666").pack(anchor="w", pady=(2, 0))
+            self.api[prov] = v
+        self._cx_deadline = 0
+        self.codex_refresh()
+
+    def _prov_cfg(self):
+        """Рабочая копия настроек с текущими значениями полей + сохранение ключей."""
+        self._collect()
+        for prov, v in self.api.items():
+            if "key" in v:
+                set_secret(prov, v["key"].get())
+        return self.cfg
+
+    def codex_refresh(self):
+        self.cx_status.set("Проверяю…")
+        path = self.cfg.get("providers", {}).get("codex", {}).get("path", "")
+
+        def work():
+            exe = find_codex(path)
+            if not exe:
+                return None, "", False, ""
+            return (exe, codex_version(exe)) + codex_status(exe)
+
+        def done(res):
+            exe, ver, ok, desc = res
+            if not exe:
+                self.cx_status.set("Codex CLI не установлен. Нажми «Установить» — установка "
+                                   "займёт пару минут.")
+            else:
+                self.cx_status.set(f"{desc}   ·   Codex {ver}")
+            for k, b in self.cx_btns.items():
+                need_exe = k != "install"
+                enabled = (bool(exe) if need_exe else not exe)
+                if k == "logout":
+                    enabled = bool(exe) and ok
+                b.state(["!disabled" if enabled else "disabled"])
+        self._bg(work, done)
+
+    def codex_install(self):
+        try:
+            open_in_terminal(codex_install_command())
+        except Exception as e:
+            self.cx_status.set(f"Не удалось запустить установку: {e}")
+            return
+        self.cx_status.set("Идёт установка в отдельном окне… Когда закончится, здесь появятся "
+                           "кнопки входа.")
+        self._cx_deadline = time.time() + 900
+
+        def poll():
+            if not self.alive or not self._cx_deadline:
+                return
+            if find_codex(""):
+                self._cx_deadline = 0
+                self.codex_refresh()
+            elif time.time() < self._cx_deadline:
+                self.top.after(4000, poll)
+        self.top.after(5000, poll)
+
+    def codex_login(self, device):
+        exe = find_codex(self.cfg.get("providers", {}).get("codex", {}).get("path", ""))
+        if not exe:
+            return
+        try:
+            open_in_terminal([exe, "login"] + (["--device-auth"] if device else []))
+        except Exception as e:
+            self.cx_status.set(f"Не удалось запустить вход: {e}")
+            return
+        self.cx_status.set("Жду входа… " + ("Открой ссылку из окна терминала и введи код."
+                                            if device else "Войди в аккаунт ChatGPT в браузере."))
+        self._cx_deadline = time.time() + 900
+
+        def poll():
+            if not self.alive or not self._cx_deadline:
+                return
+
+            def done(res):
+                ok, desc = res
+                if ok:
+                    self._cx_deadline = 0
+                    self.codex_refresh()
+                elif time.time() < self._cx_deadline:
+                    self.top.after(4000, poll)
+            self._bg(lambda: codex_status(exe), done)
+        self.top.after(5000, poll)
+
+    def codex_logout(self):
+        exe = find_codex(self.cfg.get("providers", {}).get("codex", {}).get("path", ""))
+        if not exe or not messagebox.askyesno("Выход", "Выйти из аккаунта ChatGPT в Codex?",
+                                              parent=self.top):
+            return
+        self._bg(lambda: subprocess.run([exe, "logout"], capture_output=True, timeout=60,
+                                        creationflags=NO_WINDOW),
+                 lambda _: self.codex_refresh())
+
+    def load_models(self, prov):
+        v = self.api[prov]
+        v["status"].set("Загружаю список моделей…")
+        cfg = json.loads(json.dumps(self._prov_cfg()))
+
+        def work():
+            try:
+                return list_models(prov, cfg), None
+            except Exception as e:
+                return [], explain_http_error(prov, e)
+
+        def done(res):
+            models, err = res
+            if err:
+                v["status"].set(err)
+            elif not models:
+                v["status"].set("Список пуст." + (" Для OpenRouter показываются только модели, "
+                                                  "которые видят картинки." if prov == "openrouter" else ""))
+            else:
+                v["cb"].configure(values=models)
+                v["status"].set(f"Найдено моделей: {len(models)}. Выбери в списке.")
+        self._bg(work, done)
+
+    def test_prov(self, prov):
+        target = self.api[prov]["status"] if prov in self.api else self.cx_status
+        target.set("Отправляю проверочный запрос…")
+        cfg = json.loads(json.dumps(self._prov_cfg()))
+        self._bg(lambda: test_provider(prov, cfg), lambda res: target.set(res))
+
     # --- вкладка «Claude» -------------------------------------------------
     def _tab_claude(self, f):
         ttk.Label(f, text="Модель").grid(row=0, column=0, sticky="w", pady=4)
@@ -738,6 +990,16 @@ class SettingsWindow:
         self.cfg["model"] = "" if m == MODEL_LABEL_DEFAULT else m
         self.cfg["math"] = {v: k for k, v in MATH_MODES}.get(self.math_var.get(), "latex")
         self.cfg["effort"] = {v: k for k, v in EFFORTS}.get(self.effort_var.get(), "")
+        if hasattr(self, "api"):
+            pc = self.cfg.setdefault("providers", {})
+            pc["default"] = {t: k for k, t in PROVIDERS}.get(self.def_prov.get(), "claude")
+            pc.setdefault("codex", {})["model"] = self.cx_model.get().strip()
+            for prov, v in self.api.items():
+                d = pc.setdefault(prov, {})
+                d["model"] = v["model"].get().strip()
+                for k in ("base", "scope", "ca_file"):
+                    if k in v:
+                        d[k] = v[k].get().strip()
         self.cfg["screenshot_prompt"] = (self.prompt_txt.get("1.0", "end-1c").strip()
                                          or DEFAULT_CONFIG["screenshot_prompt"])
         self.cfg["claude_path"] = self.path_var.get().strip()
@@ -750,6 +1012,9 @@ class SettingsWindow:
             return
         if self.reset_drag:
             update_state(overlay_pos=None)
+        for prov, v in getattr(self, "api", {}).items():
+            if "key" in v:
+                set_secret(prov, v["key"].get())
         self.app.apply_settings(self.cfg)
         self._close()
 
@@ -786,7 +1051,7 @@ class Manager:
         self.cfg = load_config()
         save_json(CONFIG_PATH, self.cfg)
         self.q = queue.Queue()
-        self.runner = ClaudeRunner(self.q.put)
+        self.runner = Runner(self.q.put)
         self.busy = False
         self.rid = None
         self.cur_text = ""
@@ -862,7 +1127,15 @@ class Manager:
         right = ttk.Frame(pw)
         pw.add(right, weight=1)
         self.title_var = tk.StringVar(value="")
-        ttk.Label(right, textvariable=self.title_var, font=(FAM, 12, "bold")).pack(anchor="w")
+        hr = ttk.Frame(right)
+        hr.pack(fill="x")
+        ttk.Label(hr, textvariable=self.title_var, font=(FAM, 12, "bold")).pack(side="left")
+        self.prov_var = tk.StringVar(value="")
+        self.prov_cb = ttk.Combobox(hr, textvariable=self.prov_var, state="readonly", width=40,
+                                    values=[t for _, t in PROVIDERS])
+        self.prov_cb.pack(side="right")
+        self.prov_cb.bind("<<ComboboxSelected>>", self._on_provider)
+        ttk.Label(hr, text="Нейросеть:").pack(side="right", padx=(0, 6))
         pr = ttk.Frame(right)
         pr.pack(fill="x", pady=(4, 2))
         ttk.Label(pr, text="Что делать со скриншотами:").pack(side="left")
@@ -943,7 +1216,9 @@ class Manager:
         self.chat_ids = [c["id"] for c in chats]
         self.chat_list.delete(0, "end")
         for c in chats:
-            self.chat_list.insert("end", "  " + (c.get("title") or DEFAULT_TITLE))
+            p = provider_of(c, self.cfg)
+            tag = "" if p == "claude" else f"  · {PROVIDER_SHORT[p]}"
+            self.chat_list.insert("end", "  " + (c.get("title") or DEFAULT_TITLE) + tag)
         if self.chat and self.chat["id"] in self.chat_ids:
             i = self.chat_ids.index(self.chat["id"])
             self.chat_list.selection_clear(0, "end")
@@ -972,16 +1247,33 @@ class Manager:
         self.chat = c
         self.chat_mtime = mtime(CHATS / f"{c['id']}.json")
         self.title_var.set(c.get("title") or DEFAULT_TITLE)
+        self.prov_var.set(dict(PROVIDERS)[provider_of(c, self.cfg)])
         self.prompt_var.set(c.get("screenshot_prompt", ""))
         v = self.chat_view
         v.delete("1.0", "end")
         for m in c.get("history", []):
-            self._append(m["role"], m["text"])
+            self._append(m["role"], m["text"], m.get("by"))
         if not c.get("history"):
             self._append("sys", "Новый чат. Расскажи, что будешь присылать со скриншотами и как "
                                 "отвечать, прикрепи нужные файлы (методички, условия). Потом "
                                 "запусти оверлей и жми горячую клавишу.")
         v.see("end")
+
+    def _on_provider(self, _=None):
+        label = self.prov_var.get()
+        prov = {t: k for k, t in PROVIDERS}.get(label, "claude")
+        if self.busy or chat_busy_by(self.chat["id"]):
+            self.status_var.set("Дождись ответа, потом меняй нейросеть")
+            self.prov_var.set(dict(PROVIDERS)[provider_of(self.chat, self.cfg)])
+            return
+        c = update_chat(self.chat["id"], lambda c: c.__setitem__("provider", prov))
+        if c:
+            self.chat = c
+            self.chat_mtime = mtime(CHATS / f"{c['id']}.json")
+        if self.chat.get("history"):
+            self._sys(f"Дальше в этом чате отвечает {PROVIDER_SHORT[prov]}. Прошлая переписка "
+                      "будет передана ей как контекст.")
+        self._refresh_chat_list(force=True)
 
     def new_chat(self):
         if self.busy:
@@ -989,6 +1281,8 @@ class Manager:
             return
         self._save_prompt()
         c = create_chat()
+        dflt = self.cfg.get("providers", {}).get("default", "claude")
+        c = update_chat(c["id"], lambda x: x.__setitem__("provider", dflt)) or c
         set_active_chat(c["id"])
         self._refresh_chat_list(force=True)
         self._show_chat(c["id"])
@@ -1029,12 +1323,13 @@ class Manager:
                 self.chat_mtime = mtime(CHATS / f"{c['id']}.json")
 
     # --- журнал -------------------------------------------------------------
-    def _append(self, role, text):
+    def _append(self, role, text, by=None):
         v = self.chat_view
         if role == "sys":
             v.insert("end", text + "\n\n", "sys")
         else:
-            v.insert("end", ("Вы" if role == "you" else "Claude") + "\n", role)
+            v.insert("end", ("Вы" if role == "you" else PROVIDER_SHORT.get(by or "claude", "Claude"))
+                     + "\n", role)
             if role == "claude":
                 insert_rich(v, text, fg="#1d1d1f", bg="#fbfaf8", size_pt=10,
                             enabled=self.cfg.get("math", "latex") == "latex")
@@ -1065,7 +1360,7 @@ class Manager:
             self.att_clear.pack_forget()
 
     def _prepare_attachments(self):
-        blocks, notes = [], []
+        blocks, notes, inline = [], [], []
         for src in self.attachments:
             try:
                 dest = copy_unique(src, FILES)
@@ -1077,11 +1372,26 @@ class Manager:
                     txt = dest.with_suffix(".docx.txt")
                     txt.write_text(docx_to_text(dest), encoding="utf-8")
                     notes.append(f"{dest.name} (текст извлечён в {txt})")
+                    inline.append(f"Файл {dest.name}:\n{txt.read_text(encoding='utf-8')[:60000]}")
+                elif ext == ".pdf":
+                    notes.append(str(dest))
+                    t = pdf_to_text(dest)
+                    if t:
+                        txt = dest.with_suffix(".pdf.txt")
+                        txt.write_text(t, encoding="utf-8")
+                        inline.append(f"Файл {dest.name}:\n{t[:60000]}")
+                    else:
+                        inline.append(f"(Файл {dest.name}: текст из PDF извлечь не удалось)")
                 else:
                     notes.append(str(dest))
+                    try:
+                        t = dest.read_text(encoding="utf-8")
+                        inline.append(f"Файл {dest.name}:\n{t[:60000]}")
+                    except (UnicodeDecodeError, OSError):
+                        inline.append(f"(Файл {dest.name} — не текстовый, эта нейросеть его не прочитает)")
             except Exception as e:
                 self._sys(f"Не удалось подготовить {src.name}: {e}")
-        return blocks, notes
+        return blocks, notes, inline
 
     # --- отправка -----------------------------------------------------------
     def send(self):
@@ -1091,21 +1401,19 @@ class Manager:
         if self.busy:
             self.status_var.set("Claude ещё отвечает…")
             return
-        exe = find_claude(self.cfg.get("claude_path", ""))
-        if not exe:
-            self._sys("⚠ Claude Code не найден: ⚙ Настройки → Аккаунт.")
-            self.open_settings("account")
-            return
         self._save_prompt()
         cid = self.chat["id"]
         who = acquire_chat(cid, "manager")
         if who:
             self.status_var.set(f"Сейчас в этом чате отвечает {WHO_NAMES.get(who, who)} — подожди")
             return
-        blocks, notes = self._prepare_attachments()
+        fresh = load_chat(cid) or self.chat
+        provider = provider_of(fresh, self.cfg)
+        blocks, notes, inline = self._prepare_attachments()
         prompt = text or "Посмотри на прикреплённые файлы."
-        if notes:
-            prompt += ("\n\nЯ прикрепил файлы (прочитай их инструментом Read):\n"
+        if notes and provider in ("claude", "codex"):
+            how = "инструментом Read" if provider == "claude" else "из рабочей папки"
+            prompt += (f"\n\nЯ прикрепил файлы (прочитай их {how}):\n"
                        + "\n".join("- " + n for n in notes))
         prompt += "\n\n(" + math_note(self.cfg) + ")"
         content = [{"type": "text", "text": prompt}] + blocks
@@ -1123,15 +1431,15 @@ class Manager:
         if not self.chat.get("history"):
             self.chat_view.delete("1.0", "end")
         self._append("you", shown)
-        self.chat_view.insert("end", "Claude\n", "claude")
+        self.chat_view.insert("end", PROVIDER_SHORT[provider] + "\n", "claude")
         self.chat_view.mark_set("ans", "end-1c")
         self.chat_view.mark_gravity("ans", "left")
         self.chat_view.insert("end", "…\n\n")
         self.chat_view.see("end")
         self.status_var.set("думаю…")
-        fresh = load_chat(cid) or self.chat
-        self.rid = self.runner.start(exe, content, fresh.get("session_id"),
-                                     self.cfg.get("model"), self.cfg.get("effort", ""))
+        self.spec = build_spec(provider, fresh, self.cfg, content,
+                               inline if provider not in ("claude", "codex") else ())
+        self.rid = self.runner.start_spec(self.spec)
 
     def stop(self):
         if self.busy:
@@ -1169,22 +1477,26 @@ class Manager:
         elif kind == "msg_start":
             if self.cur_text and not self.cur_text.endswith("\n\n"):
                 self.cur_text += "\n\n"
+        elif kind == "reset":
+            self.cur_text = ""
         elif kind == "delta":
             self.cur_text += ev[2]
             if not self._render_job:
                 self._render_job = self.root.after(50, self._render)
-        elif kind == "done":
-            text, sid, is_err = ev[2], ev[3], ev[4]
+        elif kind in ("done", "fail"):
+            prov = self.spec["provider"]
+            if kind == "done":
+                text, sid, is_err = ev[2], ev[3], ev[4]
+            else:
+                text, sid, is_err = ev[2], None, True
             clear = False
             if is_err and not text.startswith("⏹"):
-                text, clear = resolve_error(text)
+                text, clear = explain_error(prov, text)
                 if "вход" in text:
                     self._logged_in = False
-                    self.root.after(100, lambda: self.open_settings("account"))
+                    tab = "account" if prov == "claude" else "providers"
+                    self.root.after(100, lambda: self.open_settings(tab))
             self._finish(text or self.cur_text, sid or self.session_id, clear)
-        elif kind == "fail":
-            text, clear = resolve_error(ev[2])
-            self._finish(text, None, clear)
 
     def _render(self, final=False):
         self._render_job = None
@@ -1206,9 +1518,7 @@ class Manager:
         self.busy = False
         self.status_var.set("")
         try:
-            c = append_messages(self.req_chat, [{"role": "you", "text": self.shown},
-                                                {"role": "claude", "text": text}],
-                                session_id=sid, clear_session=clear_session)
+            c = finish_chat(self.req_chat, self.spec, self.shown, text, sid, clear_session)
         finally:
             release_chat(self.req_chat)
         if c and c["id"] == self.chat["id"]:

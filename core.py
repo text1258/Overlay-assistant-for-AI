@@ -54,6 +54,14 @@ DEFAULT_CONFIG = {
     ),
     "max_image_side": 1600,     # px, длинная сторона скриншота
     "math": "latex",            # latex — формулы картинками, plain — простым текстом
+    "providers": {               # другие нейросети (см. providers.py); ключи — в data/secrets.json
+        "default": "claude",
+        "codex": {"path": "", "model": ""},
+        "gemini": {"model": "gemini-flash-latest"},
+        "openrouter": {"model": "openrouter/free"},
+        "ollama": {"base": "http://localhost:11434/v1", "model": "qwen2.5vl:7b"},
+        "gigachat": {"model": "GigaChat-2-Max", "scope": "GIGACHAT_API_PERS", "ca_file": ""},
+    },
     "overlay": {
         "width": 460,
         "max_height": 420,
@@ -171,6 +179,19 @@ def docx_to_text(path: Path) -> str:
                 parts.append("\n")
         paras.append("".join(parts))
     return "\n".join(paras)
+
+
+def pdf_to_text(path):
+    """Текст из PDF (нужна библиотека pypdf; без неё — пустая строка)."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return ""
+    try:
+        reader = PdfReader(str(path))
+        return "\n\n".join((pg.extract_text() or "") for pg in reader.pages).strip()
+    except Exception:
+        return ""
 
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
