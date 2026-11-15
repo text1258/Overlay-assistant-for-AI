@@ -1,0 +1,1003 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+«Управление» — Claude поверх экрана.
+
+Здесь: чаты (какой из них использует оверлей), загрузка контекста — переписка
+и файлы до начала работы, настройки, запуск и остановка оверлея.
+Сам оверлей (горячие клавиши + панель) — отдельная программа overlay.py.
+"""
+import json
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+from PIL import Image
+
+from core import (
+    ACTION_NAMES, CHATS, CONFIG_PATH, CORNERS, DEFAULT_CONFIG, DEFAULT_TITLE, FILES, IMAGE_EXT,
+    IS_WIN, MANAGER_TITLE, MODELS, MODEL_LABEL_DEFAULT, NO_WINDOW, WHO_NAMES, WORK,
+    _MOD_KEYSYMS, ClaudeRunner, Overlay, acquire_chat, append_messages, auth_status,
+    chat_busy_by, chats_signature, claude_env, claude_version, clean_md, clear_pid,
+    copy_unique, create_chat, delete_chat, docx_to_text, ensure_dirs, find_claude,
+    get_active_chat, image_to_block, install_command, key_name_from_event, launch,
+    list_chats, load_chat, load_config, load_state, migrate_old_state, mods_from_state,
+    mtime, open_in_terminal, open_path, pretty_combo, release_chat, resolve_error,
+    running_pid, save_json, send_command, set_active_chat, set_dpi_aware,
+    set_hotkeys_paused, take_commands, update_chat, update_state, write_pid,
+)
+
+FAM = "Segoe UI" if IS_WIN else "Helvetica"
+
+
+class SettingsWindow:
+    def __init__(self, app, tab="account"):
+        self.app = app
+        self.cfg = json.loads(json.dumps(app.cfg))  # рабочая копия
+        self.alive = True
+        self.capturing = None
+        self.mods = set()
+        self._login_deadline = 0
+        self._install_deadline = 0
+        set_hotkeys_paused(True)  # оверлей отпускает клавиши, пока открыты настройки
+
+        t = self.top = tk.Toplevel(app.root)
+        t.title("Настройки")
+        t.geometry("700x580")
+        t.minsize(600, 500)
+        t.transient(app.root)
+        t.protocol("WM_DELETE_WINDOW", self.cancel)
+        t.bind("<KeyPress>", self._key_press)
+        t.bind("<KeyRelease>", self._key_release)
+
+        nb = self.nb = ttk.Notebook(t)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+        self.tabs = {}
+        for key, title, build in (("account", "Аккаунт", self._tab_account),
+                                  ("hotkeys", "Горячие клавиши", self._tab_hotkeys),
+                                  ("overlay", "Панель", self._tab_overlay),
+                                  ("claude", "Claude", self._tab_claude)):
+            f = ttk.Frame(nb, padding=14)
+            nb.add(f, text=title)
+            build(f)
+            self.tabs[key] = f
+        self.select(tab)
+
+        bar = ttk.Frame(t, padding=(8, 0, 8, 8))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Отмена", command=self.cancel).pack(side="right")
+        ttk.Button(bar, text="Сохранить", command=self.save).pack(side="right", padx=6)
+        self.refresh_auth()
+
+    def select(self, tab):
+        self.nb.select(self.tabs.get(tab, self.tabs["account"]))
+
+    def lift(self, tab=None):
+        if tab:
+            self.select(tab)
+        self.top.deiconify()
+        self.top.lift()
+        self.top.focus_force()
+
+    # --- фоновые задачи ---------------------------------------------------
+    def _bg(self, func, done):
+        box = []
+        threading.Thread(target=lambda: box.append(func()), daemon=True).start()
+
+        def check():
+            if not self.alive:
+                return
+            if box:
+                done(box[0])
+            else:
+                self.top.after(150, check)
+        self.top.after(150, check)
+
+    def _exe(self):
+        return find_claude(self.path_var.get().strip() if hasattr(self, "path_var")
+                           else self.cfg.get("claude_path", ""))
+
+    # --- вкладка «Аккаунт» ------------------------------------------------
+    def _tab_account(self, f):
+        ttk.Label(f, wraplength=640, text=(
+            "Приложение работает через официальный Claude Code и расходует лимиты "
+            "твоей подписки Claude (Pro или Max). API-ключ не нужен.")).pack(anchor="w")
+        self.exe_var = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.exe_var, foreground="#555", wraplength=640).pack(
+            anchor="w", pady=(12, 0))
+        self.auth_var = tk.StringVar(value="Проверяю…")
+        ttk.Label(f, textvariable=self.auth_var, wraplength=640,
+                  font=("Segoe UI" if IS_WIN else "Helvetica", 11, "bold")).pack(anchor="w", pady=10)
+        row = ttk.Frame(f)
+        row.pack(anchor="w")
+        self.btn_install = ttk.Button(row, text="Установить Claude Code", command=self.install)
+        self.btn_login = ttk.Button(row, text="Войти в аккаунт Claude", command=self.login)
+        self.btn_logout = ttk.Button(row, text="Выйти", command=self.logout)
+        self.btn_refresh = ttk.Button(row, text="Обновить", command=self.refresh_auth)
+        for b in (self.btn_install, self.btn_login, self.btn_logout, self.btn_refresh):
+            b.pack(side="left", padx=(0, 6))
+        ttk.Label(f, wraplength=640, foreground="#666", text=(
+            "Как проходит вход: откроется окно терминала и браузер с claude.ai. Войди в "
+            "аккаунт и подтверди доступ. Если браузер покажет код, скопируй его в окно "
+            "терминала и нажми Enter. Статус здесь обновится сам.")).pack(anchor="w", pady=(14, 0))
+
+    def _show_auth(self, exe, version, logged, desc):
+        if not exe:
+            self.exe_var.set("Claude Code не найден на этом компьютере.")
+            self.auth_var.set("Сначала установи Claude Code — кнопка ниже. "
+                              "Установка займёт пару минут.")
+            self.btn_install.state(["!disabled"])
+            self.btn_login.state(["disabled"])
+            self.btn_logout.state(["disabled"])
+            return
+        self.exe_var.set(f"Claude Code {version}  ·  {exe}")
+        self.auth_var.set(desc)
+        self.btn_install.state(["disabled"])
+        self.btn_login.state(["!disabled"])
+        self.btn_logout.state(["!disabled" if logged else "disabled"])
+
+    def refresh_auth(self, then=None):
+        self.auth_var.set("Проверяю…")
+
+        def work():
+            exe = self._exe()
+            if not exe:
+                return None, "", False, ""
+            return (exe, claude_version(exe)) + auth_status(exe)
+
+        def done(res):
+            self._show_auth(*res)
+            if res[2]:
+                self.app.on_auth(True, res[3])
+            if then:
+                then(res)
+        self._bg(work, done)
+
+    def login(self):
+        exe = self._exe()
+        if not exe:
+            return
+        try:
+            open_in_terminal([exe, "auth", "login"])
+        except Exception as e:
+            self.auth_var.set(f"Не удалось запустить вход: {e}")
+            return
+        self.auth_var.set("Жду входа в браузере…")
+        self._login_deadline = time.time() + 600
+        self.top.after(4000, self._poll_login)
+
+    def _poll_login(self):
+        if not self.alive or not self._login_deadline:
+            return
+
+        def done(res):
+            if res[2]:
+                self._login_deadline = 0
+                self._show_auth(*res)
+                self.app.on_auth(True, res[3])
+            elif time.time() > self._login_deadline:
+                self._login_deadline = 0
+                self._show_auth(*res)
+                self.auth_var.set("Вход так и не завершился. Попробуй ещё раз.")
+            else:
+                self.auth_var.set("Жду входа в браузере…")
+                self.top.after(3000, self._poll_login)
+        exe = self._exe()
+        self._bg(lambda: (exe, claude_version(exe)) + auth_status(exe), done)
+
+    def logout(self):
+        exe = self._exe()
+        if not exe or not messagebox.askyesno(
+                "Выход", "Выйти из аккаунта Claude в Claude Code?", parent=self.top):
+            return
+        self.auth_var.set("Выхожу…")
+        self._bg(lambda: subprocess.run([exe, "auth", "logout"], capture_output=True, timeout=60,
+                                        env=claude_env(), creationflags=NO_WINDOW),
+                 lambda _: self.refresh_auth())
+
+    def install(self):
+        try:
+            open_in_terminal(install_command())
+        except Exception as e:
+            self.auth_var.set(f"Не удалось запустить установку: {e}")
+            return
+        self.auth_var.set("Идёт установка в отдельном окне… Как только Claude Code "
+                          "появится, здесь станет доступна кнопка входа.")
+        self._install_deadline = time.time() + 900
+        self.top.after(5000, self._poll_install)
+
+    def _poll_install(self):
+        if not self.alive or not self._install_deadline:
+            return
+        if self._exe():
+            self._install_deadline = 0
+            self.refresh_auth()
+        elif time.time() < self._install_deadline:
+            self.top.after(4000, self._poll_install)
+
+    # --- вкладка «Горячие клавиши» ----------------------------------------
+    def _tab_hotkeys(self, f):
+        ttk.Label(f, wraplength=640, foreground="#666", text=(
+            "Нажми «Изменить», затем нужное сочетание. Работают сочетания с Ctrl, Alt "
+            "или Win, а также F1–F24. Пока открыто окно настроек, горячие клавиши "
+            "оверлея на паузе.")).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        self.hk_vars = {}
+        for i, (action, name) in enumerate(ACTION_NAMES, start=1):
+            ttk.Label(f, text=name).grid(row=i, column=0, sticky="w", pady=3)
+            v = tk.StringVar(value=pretty_combo(self.cfg["hotkeys"].get(action, "")))
+            self.hk_vars[action] = v
+            ttk.Label(f, textvariable=v, width=20, anchor="center", relief="groove",
+                      padding=(4, 3)).grid(row=i, column=1, padx=8)
+            ttk.Button(f, text="Изменить",
+                       command=lambda a=action: self.start_capture(a)).grid(row=i, column=2)
+            ttk.Button(f, text="✕", width=3,
+                       command=lambda a=action: self.set_hotkey(a, "")).grid(row=i, column=3,
+                                                                             padx=(4, 0))
+        n = len(ACTION_NAMES) + 1
+        self.hk_msg = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.hk_msg, foreground="#b3261e", wraplength=640).grid(
+            row=n, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Button(f, text="Вернуть по умолчанию", command=self.reset_hotkeys).grid(
+            row=n + 1, column=0, sticky="w", pady=(8, 0))
+        f.columnconfigure(0, weight=1)
+
+    def start_capture(self, action):
+        if self.capturing:
+            self.hk_vars[self.capturing].set(pretty_combo(self.cfg["hotkeys"].get(self.capturing)))
+        self.capturing = action
+        self.mods = set()
+        self.hk_vars[action].set("нажми сочетание… (Esc — отмена)")
+        self.hk_msg.set("")
+        self.top.focus_force()
+
+    def _key_press(self, e):
+        if not self.capturing:
+            return None
+        ks = e.keysym
+        if ks in _MOD_KEYSYMS:
+            if _MOD_KEYSYMS[ks]:
+                self.mods.add(_MOD_KEYSYMS[ks])
+            return "break"
+        action = self.capturing
+        if ks == "Escape":
+            self.capturing = None
+            self.hk_vars[action].set(pretty_combo(self.cfg["hotkeys"].get(action)))
+            return "break"
+        key = key_name_from_event(e)
+        if not key:
+            self.hk_msg.set(f"Клавишу «{ks}» назначить нельзя — выбери другую.")
+            return "break"
+        # Ctrl/Alt/Shift берём из состояния клавиатуры в момент нажатия (не залипают),
+        # Win — из отслеживания нажатий (в state его нет)
+        mods = mods_from_state(e.state) | ({"win"} & self.mods)
+        if not ({"ctrl", "alt", "win"} & mods) and not re.fullmatch(r"f\d+", key):
+            self.hk_msg.set("Добавь Ctrl, Alt или Win — иначе клавиша будет мешать обычному "
+                            "набору текста. Без модификаторов можно только F1–F24.")
+            return "break"
+        combo = "+".join([m for m in ("ctrl", "alt", "shift", "win") if m in mods] + [key])
+        for other, name in ACTION_NAMES:
+            if other != action and self.cfg["hotkeys"].get(other) == combo:
+                self.hk_msg.set(f"{pretty_combo(combo)} уже назначено: «{name}».")
+                return "break"
+        self.set_hotkey(action, combo)
+        return "break"
+
+    def _key_release(self, e):
+        m = _MOD_KEYSYMS.get(e.keysym)
+        if m:
+            self.mods.discard(m)
+
+    def set_hotkey(self, action, combo):
+        self.cfg["hotkeys"][action] = combo
+        self.hk_vars[action].set(pretty_combo(combo))
+        if self.capturing == action:
+            self.capturing = None
+        self.hk_msg.set("")
+
+    def reset_hotkeys(self):
+        self.capturing = None
+        for action, _ in ACTION_NAMES:
+            self.set_hotkey(action, DEFAULT_CONFIG["hotkeys"][action])
+
+    # --- вкладка «Панель» -------------------------------------------------
+    def _spin(self, f, row, text, var, lo, hi, step=1, hint=""):
+        ttk.Label(f, text=text).grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Spinbox(f, from_=lo, to=hi, increment=step, textvariable=var, width=8).grid(
+            row=row, column=1, sticky="w", padx=8)
+        if hint:
+            ttk.Label(f, text=hint, foreground="#777").grid(row=row, column=2, sticky="w")
+
+    def _tab_overlay(self, f):
+        o = self.cfg["overlay"]
+        self.ov = {
+            "width": tk.IntVar(value=o["width"]),
+            "max_height": tk.IntVar(value=o["max_height"]),
+            "font_size": tk.IntVar(value=o["font_size"]),
+            "opacity": tk.DoubleVar(value=o["opacity"]),
+            "auto_hide_seconds": tk.IntVar(value=o["auto_hide_seconds"]),
+            "corner": tk.StringVar(value=dict(CORNERS).get(o.get("corner"), CORNERS[0][1])),
+        }
+        self._spin(f, 0, "Ширина, px", self.ov["width"], 250, 1600, 10)
+        self._spin(f, 1, "Макс. высота, px", self.ov["max_height"], 100, 1400, 10)
+        self._spin(f, 2, "Размер шрифта", self.ov["font_size"], 8, 28)
+        ttk.Label(f, text="Непрозрачность").grid(row=3, column=0, sticky="w", pady=4)
+        op_lbl = ttk.Label(f, text=f"{int(o['opacity'] * 100)}%")
+        ttk.Scale(f, from_=0.3, to=1.0, variable=self.ov["opacity"], length=160,
+                  command=lambda v: op_lbl.configure(text=f"{int(float(v) * 100)}%")).grid(
+            row=3, column=1, sticky="w", padx=8)
+        op_lbl.grid(row=3, column=2, sticky="w")
+        ttk.Label(f, text="Угол экрана").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Combobox(f, textvariable=self.ov["corner"], state="readonly", width=16,
+                     values=[c[1] for c in CORNERS]).grid(row=4, column=1, columnspan=2,
+                                                          sticky="w", padx=8)
+        self._spin(f, 5, "Прятать через, сек", self.ov["auto_hide_seconds"], 0, 600, 5,
+                   "0 — не прятать")
+        row = ttk.Frame(f)
+        row.grid(row=6, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        ttk.Button(row, text="Предпросмотр", command=self.preview).pack(side="left")
+        ttk.Button(row, text="Вернуть панель в угол", command=self.reset_pos).pack(side="left",
+                                                                                   padx=6)
+        ttk.Label(f, wraplength=640, foreground="#666", text=(
+            "Если панель перетаскивали, она остаётся на новом месте. Чтобы снова "
+            "привязать её к углу, нажми «Вернуть панель в угол».")).grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+    def preview(self):
+        err = self._collect()
+        if err:
+            messagebox.showerror("Настройки", err, parent=self.top)
+            return
+        ov = self.app.preview_panel()
+        ov.apply_config(self.cfg)
+        ov.show()
+        ov.set_status("предпросмотр")
+        ov.set_text("Так будет выглядеть ответ.\n\n• Пункт первый\n• Пункт второй\n\n"
+                    "x² + 2x + 1 = (x + 1)²")
+
+    def reset_pos(self):
+        update_state(overlay_pos=None)
+        self.app.panel_state["overlay_pos"] = None
+        self.preview()
+
+    # --- вкладка «Claude» -------------------------------------------------
+    def _tab_claude(self, f):
+        ttk.Label(f, text="Модель").grid(row=0, column=0, sticky="w", pady=4)
+        self.model_var = tk.StringVar(value=self.cfg.get("model") or MODEL_LABEL_DEFAULT)
+        ttk.Combobox(f, textvariable=self.model_var, values=MODELS, state="readonly",
+                     width=16).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(f, text="sonnet — быстрее, opus — умнее", foreground="#777").grid(
+            row=0, column=2, sticky="w")
+        self.side_var = tk.IntVar(value=self.cfg.get("max_image_side", 1600))
+        self._spin(f, 1, "Размер скриншота, px", self.side_var, 600, 3000, 100,
+                   "по длинной стороне")
+        ttk.Label(f, text="Текст к скриншоту по горячей клавише:").grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        self.prompt_txt = tk.Text(f, height=4, wrap="word", relief="solid", bd=1,
+                                  font=("Segoe UI" if IS_WIN else "Helvetica", 10))
+        self.prompt_txt.insert("1.0", self.cfg.get("screenshot_prompt", ""))
+        self.prompt_txt.grid(row=3, column=0, columnspan=3, sticky="ew")
+        ttk.Label(f, text="Путь к Claude Code (если не находится сам):").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(12, 2))
+        self.path_var = tk.StringVar(value=self.cfg.get("claude_path", ""))
+        prow = ttk.Frame(f)
+        prow.grid(row=5, column=0, columnspan=3, sticky="ew")
+        ttk.Entry(prow, textvariable=self.path_var).pack(side="left", fill="x", expand=True)
+        ttk.Button(prow, text="Обзор…", command=self._browse).pack(side="left", padx=(6, 0))
+        ttk.Button(f, text="Открыть постоянные инструкции (CLAUDE.md)",
+                   command=lambda: open_path(WORK / "CLAUDE.md")).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        ttk.Label(f, wraplength=640, foreground="#666", text=(
+            "В CLAUDE.md — то, что Claude учитывает в каждом ответе: язык, стиль, "
+            "краткость. Изменения действуют с нового диалога.")).grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        f.columnconfigure(2, weight=1)
+
+    def _browse(self):
+        p = filedialog.askopenfilename(parent=self.top, title="Где находится claude",
+                                       filetypes=[("claude", "claude*"), ("Все файлы", "*")])
+        if p:
+            self.path_var.set(p)
+
+    # --- сохранение -------------------------------------------------------
+    def _collect(self):
+        def num(var, lo, hi, name, cast=int):
+            try:
+                v = cast(var.get())
+            except (tk.TclError, ValueError):
+                raise ValueError(f"«{name}»: нужно число")
+            return max(lo, min(hi, v))
+        try:
+            o = self.cfg["overlay"]
+            o["width"] = num(self.ov["width"], 250, 1600, "Ширина")
+            o["max_height"] = num(self.ov["max_height"], 100, 1400, "Макс. высота")
+            o["font_size"] = num(self.ov["font_size"], 8, 28, "Размер шрифта")
+            o["opacity"] = round(num(self.ov["opacity"], 0.3, 1.0, "Непрозрачность", float), 2)
+            o["auto_hide_seconds"] = num(self.ov["auto_hide_seconds"], 0, 600, "Прятать через")
+            o["corner"] = {v: k for k, v in CORNERS}.get(self.ov["corner"].get(), "top-right")
+            self.cfg["max_image_side"] = num(self.side_var, 600, 3000, "Размер скриншота")
+        except ValueError as e:
+            return str(e)
+        m = self.model_var.get()
+        self.cfg["model"] = "" if m == MODEL_LABEL_DEFAULT else m
+        self.cfg["screenshot_prompt"] = (self.prompt_txt.get("1.0", "end-1c").strip()
+                                         or DEFAULT_CONFIG["screenshot_prompt"])
+        self.cfg["claude_path"] = self.path_var.get().strip()
+        return None
+
+    def save(self):
+        err = self._collect()
+        if err:
+            messagebox.showerror("Настройки", err, parent=self.top)
+            return
+        self.app.apply_settings(self.cfg)
+        self._close()
+
+    def cancel(self):
+        self._close()
+
+    def _close(self):
+        self.alive = False
+        self.capturing = None
+        self.top.destroy()
+        self.app.settings = None
+        self.app.hide_preview()
+        set_hotkeys_paused(False)
+
+
+# ----------------------------------------------------------------------------
+# Главное окно «Управление»
+# ----------------------------------------------------------------------------
+class Manager:
+    def __init__(self):
+        ensure_dirs()
+        migrate_old_state()
+        if running_pid("manager"):
+            send_command("focus", "manager")
+            focus_window_safe()
+            sys.exit(0)
+        write_pid("manager")
+        set_dpi_aware()
+
+        self.cfg = load_config()
+        save_json(CONFIG_PATH, self.cfg)
+        self.q = queue.Queue()
+        self.runner = ClaudeRunner(self.q.put)
+        self.busy = False
+        self.rid = None
+        self.cur_text = ""
+        self.attachments = []
+        self.settings = None
+        self._render_job = None
+        self._preview = None
+        self.panel_state = load_state()
+        self._logged_in = False
+
+        self.chat = get_active_chat()
+        self.chat_mtime = 0.0
+        self.chats_sig = None
+        self.chat_ids = []
+
+        self.root = root = tk.Tk()
+        root.title(MANAGER_TITLE)
+        root.geometry("980x700")
+        root.minsize(720, 480)
+        root.protocol("WM_DELETE_WINDOW", self.quit)
+        self._build_ui()
+        self._refresh_chat_list(force=True)
+        self._show_chat(self.chat["id"])
+        self._check_claude()
+        root.after(30, self._poll_queue)
+        root.after(300, self._poll_files)
+
+    # --- интерфейс ---------------------------------------------------------
+    def _build_ui(self):
+        r = self.root
+        top = ttk.Frame(r, padding=(8, 6))
+        top.pack(fill="x")
+        ttk.Label(top, text="Оверлей:").pack(side="left")
+        self.ov_status = ttk.Label(top, text="…", width=14)
+        self.ov_status.pack(side="left", padx=(4, 6))
+        self.ov_btn = ttk.Button(top, text="▶ Запустить", command=self.toggle_overlay)
+        self.ov_btn.pack(side="left")
+        ttk.Button(top, text="📁 Папка", command=lambda: open_path(WORK)).pack(side="right")
+        ttk.Button(top, text="⚙ Настройки", command=self.open_settings).pack(side="right", padx=6)
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.status_var, foreground="#777").pack(side="right", padx=10)
+
+        pw = ttk.PanedWindow(r, orient="horizontal")
+        pw.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        # левая колонка: чаты
+        left = ttk.Frame(pw, padding=(0, 0, 6, 0))
+        pw.add(left, weight=0)
+        ttk.Label(left, text="Чаты", font=(FAM, 10, "bold")).pack(anchor="w")
+        ttk.Label(left, text="оверлей отвечает в выбранном", foreground="#777",
+                  font=(FAM, 8)).pack(anchor="w")
+        lb_frame = ttk.Frame(left)
+        lb_frame.pack(fill="both", expand=True, pady=4)
+        self.chat_list = tk.Listbox(lb_frame, width=28, activestyle="none", exportselection=False,
+                                    font=(FAM, 10), relief="flat", bg="#f4f2ee",
+                                    selectbackground="#d97757", selectforeground="white")
+        sb = ttk.Scrollbar(lb_frame, command=self.chat_list.yview)
+        self.chat_list.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.chat_list.pack(side="left", fill="both", expand=True)
+        self.chat_list.bind("<<ListboxSelect>>", self._on_select_chat)
+        self.chat_list.bind("<Double-Button-1>", lambda e: self.rename_chat())
+        btns = ttk.Frame(left)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="+ Новый чат", command=self.new_chat).pack(side="left", fill="x",
+                                                                          expand=True)
+        ttk.Button(btns, text="✎", width=3, command=self.rename_chat).pack(side="left", padx=2)
+        ttk.Button(btns, text="🗑", width=3, command=self.remove_chat).pack(side="left")
+
+        # правая часть: выбранный чат
+        right = ttk.Frame(pw)
+        pw.add(right, weight=1)
+        self.title_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=self.title_var, font=(FAM, 12, "bold")).pack(anchor="w")
+        pr = ttk.Frame(right)
+        pr.pack(fill="x", pady=(4, 2))
+        ttk.Label(pr, text="Что делать со скриншотами:").pack(side="left")
+        self.prompt_var = tk.StringVar(value="")
+        self.prompt_entry = ttk.Entry(pr, textvariable=self.prompt_var)
+        self.prompt_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.prompt_entry.bind("<FocusOut>", lambda e: self._save_prompt())
+        self.prompt_entry.bind("<Return>", lambda e: (self._save_prompt(), self.input.focus_set()))
+        ttk.Label(right, foreground="#888", font=(FAM, 8), text=(
+            "Пусто — берётся текст из настроек. Пример: «Реши задачу, дай ответ и короткое "
+            "решение»")).pack(anchor="w")
+
+        mid = ttk.Frame(right)
+        self.chat_view = tk.Text(mid, wrap="word", font=(FAM, 10), padx=8, pady=6, width=40,
+                                 height=10, relief="flat", bg="#fbfaf8")
+        vsb = ttk.Scrollbar(mid, command=self.chat_view.yview)
+        self.chat_view.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.chat_view.pack(side="left", fill="both", expand=True)
+        self.chat_view.tag_configure("you", foreground="#1f5fbf", font=(FAM, 10, "bold"))
+        self.chat_view.tag_configure("claude", foreground="#c15f3c", font=(FAM, 10, "bold"))
+        self.chat_view.tag_configure("sys", foreground="#888", font=(FAM, 9, "italic"))
+        self.chat_view.bind("<Key>", self._readonly_keys)
+
+        att = ttk.Frame(right, padding=(0, 2))
+        self.att_var = tk.StringVar(value="")
+        ttk.Label(att, textvariable=self.att_var, foreground="#555").pack(side="left")
+        self.att_clear = ttk.Button(att, text="убрать", command=self._clear_att)
+
+        bot = ttk.Frame(right, padding=(0, 4))
+        bb = ttk.Frame(bot)
+        bb.pack(side="right", padx=(6, 0))
+        ttk.Button(bb, text="Отправить", command=self.send).pack(fill="x")
+        ttk.Button(bb, text="📎 Файлы", command=self._attach).pack(fill="x", pady=2)
+        ttk.Button(bb, text="■ Стоп", command=self.stop).pack(fill="x")
+        self.input = tk.Text(bot, height=4, width=30, wrap="word", font=(FAM, 10),
+                             relief="solid", bd=1)
+        self.input.pack(side="left", fill="both", expand=True)
+        self.input.bind("<Return>", self._enter)
+
+        self.help_label = ttk.Label(right, text="", wraplength=640, foreground="#777",
+                                    font=(FAM, 8))
+        self.help_label.pack(side="bottom", fill="x", pady=(0, 4))
+        bot.pack(side="bottom", fill="x")
+        att.pack(side="bottom", fill="x")
+        mid.pack(fill="both", expand=True, pady=(6, 0))
+        self._update_help()
+
+    def _update_help(self):
+        hk = self.cfg["hotkeys"]
+        short = {"shot": "скриншот", "region": "скриншот области", "toggle": "скрыть/показать",
+                 "scroll_up": "прокрутка ↑", "scroll_down": "прокрутка ↓", "move": "двигать панель",
+                 "chat": "это окно", "stop": "стоп", "quit": "закрыть оверлей"}
+        items = [f"{pretty_combo(hk[a])} — {short[a]}" for a, _ in ACTION_NAMES if hk.get(a)]
+        self.help_label.configure(text="Оверлей: " + " · ".join(items) +
+                                  ".   Здесь: Enter — отправить, Shift+Enter — новая строка.")
+
+    def _readonly_keys(self, e):
+        if (e.state & 0x4) and e.keysym.lower() in ("c", "a", "insert"):
+            return None
+        if e.keysym in ("Left", "Right", "Up", "Down", "Prior", "Next", "Home", "End"):
+            return None
+        return "break"
+
+    def _enter(self, e):
+        if e.state & 0x1:
+            return None
+        self.send()
+        return "break"
+
+    # --- список чатов -----------------------------------------------------
+    def _refresh_chat_list(self, force=False):
+        sig = chats_signature()
+        if not force and sig == self.chats_sig:
+            return
+        self.chats_sig = sig
+        chats = list_chats()
+        self.chat_ids = [c["id"] for c in chats]
+        self.chat_list.delete(0, "end")
+        for c in chats:
+            self.chat_list.insert("end", "  " + (c.get("title") or DEFAULT_TITLE))
+        if self.chat and self.chat["id"] in self.chat_ids:
+            i = self.chat_ids.index(self.chat["id"])
+            self.chat_list.selection_clear(0, "end")
+            self.chat_list.selection_set(i)
+            self.chat_list.see(i)
+
+    def _on_select_chat(self, _=None):
+        sel = self.chat_list.curselection()
+        if not sel:
+            return
+        cid = self.chat_ids[sel[0]]
+        if cid == self.chat["id"]:
+            return
+        if self.busy:
+            self.status_var.set("Дождись ответа Claude в текущем чате")
+            self._refresh_chat_list(force=True)
+            return
+        self._save_prompt()
+        set_active_chat(cid)
+        self._show_chat(cid)
+
+    def _show_chat(self, cid):
+        c = load_chat(cid)
+        if not c:
+            c = get_active_chat()
+        self.chat = c
+        self.chat_mtime = mtime(CHATS / f"{c['id']}.json")
+        self.title_var.set(c.get("title") or DEFAULT_TITLE)
+        self.prompt_var.set(c.get("screenshot_prompt", ""))
+        v = self.chat_view
+        v.delete("1.0", "end")
+        for m in c.get("history", []):
+            self._append(m["role"], m["text"])
+        if not c.get("history"):
+            self._append("sys", "Новый чат. Расскажи, что будешь присылать со скриншотами и как "
+                                "отвечать, прикрепи нужные файлы (методички, условия). Потом "
+                                "запусти оверлей и жми горячую клавишу.")
+        v.see("end")
+
+    def new_chat(self):
+        if self.busy:
+            self.status_var.set("Дождись ответа Claude")
+            return
+        self._save_prompt()
+        c = create_chat()
+        set_active_chat(c["id"])
+        self._refresh_chat_list(force=True)
+        self._show_chat(c["id"])
+        self._refresh_chat_list(force=True)
+        self.input.focus_set()
+
+    def rename_chat(self):
+        name = simpledialog.askstring("Переименовать чат", "Название:", parent=self.root,
+                                      initialvalue=self.chat.get("title", ""))
+        if name and name.strip():
+            update_chat(self.chat["id"], lambda c: c.__setitem__("title", name.strip()[:60]))
+            self.title_var.set(name.strip()[:60])
+            self._refresh_chat_list(force=True)
+
+    def remove_chat(self):
+        cid = self.chat["id"]
+        who = chat_busy_by(cid)
+        if who or self.busy:
+            messagebox.showinfo("Удаление", "Сейчас в этом чате отвечает Claude — дождись ответа.",
+                                parent=self.root)
+            return
+        if not messagebox.askyesno("Удалить чат", f"Удалить чат «{self.chat.get('title')}»?\n"
+                                   "Переписка пропадёт.", parent=self.root):
+            return
+        delete_chat(cid)
+        update_state(active_chat=None)
+        self.chat = get_active_chat()
+        self._refresh_chat_list(force=True)
+        self._show_chat(self.chat["id"])
+        self._refresh_chat_list(force=True)
+
+    def _save_prompt(self):
+        v = self.prompt_var.get().strip()
+        if self.chat and v != (self.chat.get("screenshot_prompt") or ""):
+            c = update_chat(self.chat["id"], lambda c: c.__setitem__("screenshot_prompt", v))
+            if c:
+                self.chat = c
+                self.chat_mtime = mtime(CHATS / f"{c['id']}.json")
+
+    # --- журнал -------------------------------------------------------------
+    def _append(self, role, text):
+        v = self.chat_view
+        if role == "sys":
+            v.insert("end", text + "\n\n", "sys")
+        else:
+            v.insert("end", ("Вы" if role == "you" else "Claude") + "\n", role)
+            v.insert("end", (clean_md(text) if role == "claude" else text) + "\n\n")
+        v.see("end")
+
+    def _sys(self, text):
+        self._append("sys", text)
+
+    # --- вложения -----------------------------------------------------------
+    def _attach(self):
+        for p in filedialog.askopenfilenames(title="Файлы для Claude", parent=self.root):
+            self.attachments.append(Path(p))
+        self._refresh_att()
+
+    def _clear_att(self):
+        self.attachments = []
+        self._refresh_att()
+
+    def _refresh_att(self):
+        if self.attachments:
+            self.att_var.set("📎 " + ", ".join(p.name for p in self.attachments))
+            self.att_clear.pack(side="left", padx=6)
+        else:
+            self.att_var.set("")
+            self.att_clear.pack_forget()
+
+    def _prepare_attachments(self):
+        blocks, notes = [], []
+        for src in self.attachments:
+            try:
+                dest = copy_unique(src, FILES)
+                ext = dest.suffix.lower()
+                if ext in IMAGE_EXT:
+                    blocks.append({"type": "text", "text": f"Картинка: {dest.name}"})
+                    blocks.append(image_to_block(Image.open(dest), self.cfg["max_image_side"]))
+                elif ext == ".docx":
+                    txt = dest.with_suffix(".docx.txt")
+                    txt.write_text(docx_to_text(dest), encoding="utf-8")
+                    notes.append(f"{dest.name} (текст извлечён в {txt})")
+                else:
+                    notes.append(str(dest))
+            except Exception as e:
+                self._sys(f"Не удалось подготовить {src.name}: {e}")
+        return blocks, notes
+
+    # --- отправка -----------------------------------------------------------
+    def send(self):
+        text = self.input.get("1.0", "end-1c").strip()
+        if not text and not self.attachments:
+            return
+        if self.busy:
+            self.status_var.set("Claude ещё отвечает…")
+            return
+        exe = find_claude(self.cfg.get("claude_path", ""))
+        if not exe:
+            self._sys("⚠ Claude Code не найден: ⚙ Настройки → Аккаунт.")
+            self.open_settings("account")
+            return
+        self._save_prompt()
+        cid = self.chat["id"]
+        who = acquire_chat(cid, "manager")
+        if who:
+            self.status_var.set(f"Сейчас в этом чате отвечает {WHO_NAMES.get(who, who)} — подожди")
+            return
+        blocks, notes = self._prepare_attachments()
+        prompt = text or "Посмотри на прикреплённые файлы."
+        if notes:
+            prompt += ("\n\nЯ прикрепил файлы (прочитай их инструментом Read):\n"
+                       + "\n".join("- " + n for n in notes))
+        content = [{"type": "text", "text": prompt}] + blocks
+        shown = text
+        if self.attachments:
+            shown += ("\n" if shown else "") + "📎 " + ", ".join(p.name for p in self.attachments)
+        self.input.delete("1.0", "end")
+        self._clear_att()
+
+        self.busy = True
+        self.shown = shown
+        self.cur_text = ""
+        self.session_id = None
+        self.req_chat = cid
+        if not self.chat.get("history"):
+            self.chat_view.delete("1.0", "end")
+        self._append("you", shown)
+        self.chat_view.insert("end", "Claude\n", "claude")
+        self.chat_view.mark_set("ans", "end-1c")
+        self.chat_view.mark_gravity("ans", "left")
+        self.chat_view.insert("end", "…\n\n")
+        self.chat_view.see("end")
+        self.status_var.set("думаю…")
+        fresh = load_chat(cid) or self.chat
+        self.rid = self.runner.start(exe, content, fresh.get("session_id"), self.cfg.get("model"))
+
+    def stop(self):
+        if self.busy:
+            self.runner.stop()
+
+    def _poll_queue(self):
+        try:
+            while True:
+                self._handle(self.q.get_nowait())
+        except queue.Empty:
+            pass
+        self.root.after(30, self._poll_queue)
+
+    def _handle(self, ev):
+        kind = ev[0]
+        if kind == "auth":
+            _, exe, version, logged, desc = ev
+            self.status_var.set(version)
+            if not exe:
+                self._sys("⚠ Claude Code не найден. Установи его: ⚙ Настройки → Аккаунт → "
+                          "«Установить Claude Code».")
+                self.open_settings("account")
+            elif not logged:
+                self._sys("⚠ Нужно войти в аккаунт Claude: ⚙ Настройки → Аккаунт → «Войти».")
+                self.open_settings("account")
+            else:
+                self.on_auth(True, desc)
+            return
+        if ev[1] != self.rid:
+            return
+        if kind == "session":
+            self.session_id = ev[2]
+        elif kind == "status":
+            self.status_var.set(ev[2])
+        elif kind == "msg_start":
+            if self.cur_text and not self.cur_text.endswith("\n\n"):
+                self.cur_text += "\n\n"
+        elif kind == "delta":
+            self.cur_text += ev[2]
+            if not self._render_job:
+                self._render_job = self.root.after(50, self._render)
+        elif kind == "done":
+            text, sid, is_err = ev[2], ev[3], ev[4]
+            clear = False
+            if is_err and not text.startswith("⏹"):
+                text, clear = resolve_error(text)
+                if "вход" in text:
+                    self._logged_in = False
+                    self.root.after(100, lambda: self.open_settings("account"))
+            self._finish(text or self.cur_text, sid or self.session_id, clear)
+        elif kind == "fail":
+            text, clear = resolve_error(ev[2])
+            self._finish(text, None, clear)
+
+    def _render(self, final=False):
+        self._render_job = None
+        if self.req_chat != self.chat["id"]:
+            return
+        v = self.chat_view
+        v.delete("ans", "end-1c")
+        v.insert("end", clean_md(self.cur_text) + ("\n\n" if final else " ▍\n\n"))
+        v.see("end")
+
+    def _finish(self, text, sid, clear_session):
+        if self._render_job:
+            self.root.after_cancel(self._render_job)
+            self._render_job = None
+        self.cur_text = text
+        self._render(final=True)
+        self.busy = False
+        self.status_var.set("")
+        try:
+            c = append_messages(self.req_chat, [{"role": "you", "text": self.shown},
+                                                {"role": "claude", "text": text}],
+                                session_id=sid, clear_session=clear_session)
+        finally:
+            release_chat(self.req_chat)
+        if c and c["id"] == self.chat["id"]:
+            self.chat = c
+            self.chat_mtime = mtime(CHATS / f"{c['id']}.json")
+            self.title_var.set(c.get("title") or DEFAULT_TITLE)
+        self._refresh_chat_list(force=True)
+
+    # --- фоновая сверка с оверлеем -----------------------------------------
+    def _poll_files(self):
+        try:
+            for cmd in take_commands("manager"):
+                if cmd == "focus":
+                    self.bring_to_front()
+            ov = running_pid("overlay")
+            self.ov_status.configure(text="● работает" if ov else "○ остановлен",
+                                     foreground="#2e7d32" if ov else "#888")
+            self.ov_btn.configure(text="■ Остановить" if ov else "▶ Запустить")
+            self._refresh_chat_list()
+            if not self.busy:
+                path = CHATS / f"{self.chat['id']}.json"
+                m = mtime(path)
+                if not m:  # чат удалили
+                    self.chat = get_active_chat()
+                    self._show_chat(self.chat["id"])
+                elif m != self.chat_mtime:
+                    self._show_chat(self.chat["id"])  # оверлей дописал ответ
+                who = chat_busy_by(self.chat["id"])
+                if who == "overlay":
+                    self.status_var.set("оверлей отвечает на скриншот…")
+                elif self.status_var.get() == "оверлей отвечает на скриншот…":
+                    self.status_var.set("")
+        finally:
+            self.root.after(700, self._poll_files)
+
+    def toggle_overlay(self):
+        if running_pid("overlay"):
+            send_command("stop")
+            self.ov_status.configure(text="останавливаю…")
+        else:
+            try:
+                launch("overlay.py")
+                self.ov_status.configure(text="запускаю…")
+            except Exception as e:
+                messagebox.showerror("Оверлей", f"Не удалось запустить оверлей: {e}",
+                                     parent=self.root)
+
+    def bring_to_front(self):
+        r = self.root
+        r.deiconify()
+        r.lift()
+        r.attributes("-topmost", True)
+        r.after(300, lambda: r.attributes("-topmost", False))
+        r.focus_force()
+
+    # --- настройки ------------------------------------------------------------
+    def open_settings(self, tab="account"):
+        if self.settings and self.settings.alive:
+            self.settings.lift(tab)
+        else:
+            self.settings = SettingsWindow(self, tab)
+
+    def apply_settings(self, cfg):
+        self.cfg = cfg
+        save_json(CONFIG_PATH, cfg)  # оверлей подхватит изменения сам
+        self._update_help()
+
+    def preview_panel(self):
+        if self._preview is None:
+            self.panel_state = load_state()
+            self._preview = Overlay(self.root, self.cfg, self.panel_state, lambda: None)
+        return self._preview
+
+    def hide_preview(self):
+        if self._preview is not None:
+            self._preview.hide()
+
+    def on_auth(self, logged, desc):
+        if logged and not self._logged_in:
+            self._logged_in = True
+            self.status_var.set(desc.splitlines()[0])
+
+    def _check_claude(self):
+        path = self.cfg.get("claude_path", "")
+
+        def check():
+            exe = find_claude(path)
+            if not exe:
+                self.q.put(("auth", None, "", False, ""))
+                return
+            self.q.put(("auth", exe, claude_version(exe)) + auth_status(exe))
+        threading.Thread(target=check, daemon=True).start()
+
+    def quit(self):
+        try:
+            self._save_prompt()
+            if self.busy:
+                self.runner.stop()
+                release_chat(self.req_chat)
+            if self.settings and self.settings.alive:
+                set_hotkeys_paused(False)
+        finally:
+            clear_pid("manager")
+            self.root.destroy()
+
+    def run(self):
+        try:
+            self.root.mainloop()
+        finally:
+            clear_pid("manager")
+
+
+def focus_window_safe():
+    try:
+        from core import focus_window
+        focus_window(MANAGER_TITLE)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    Manager().run()

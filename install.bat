@@ -24,5 +24,5 @@ if errorlevel 1 (
   echo Claude Code найден. Если ещё не входил - запусти в терминале  claude  и войди.
 )
 echo.
-echo Готово. Запускай start.bat
+echo Готово. Запускай start_manager.bat (чаты и настройки) и start_overlay.bat (оверлей).
 pause

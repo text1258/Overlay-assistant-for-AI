@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Оверлей «Claude поверх экрана»: работает в фоне без окон.
+
+Горячая клавиша → скриншот экрана/области → активный чат (выбирается в «Управлении»)
+→ ответ в полупрозрачной панели поверх всех окон, которая пропускает клики мыши.
+"""
+import queue
+import sys
+import threading
+import tkinter as tk
+
+from core import (
+    ACTION_NAMES, CONFIG_PATH, STATE_PATH, WHO_NAMES, ClaudeRunner, Overlay, PynputHotkeys,
+    RegionSelector, WinHotkeys, IS_WIN, MANAGER_TITLE, acquire_chat, append_messages,
+    auth_status, claude_version, clear_pid, ensure_dirs, find_claude, focus_window,
+    get_active_chat, grab_screen_at, hotkeys_paused, image_to_block, launch, load_chat,
+    load_config, load_state, migrate_old_state, mtime, pretty_combo, release_chat,
+    resolve_error, running_pid, send_command, set_dpi_aware, take_commands, update_state,
+    write_pid,
+)
+
+
+class OverlayApp:
+    def __init__(self):
+        ensure_dirs()
+        migrate_old_state()
+        if running_pid("overlay"):
+            send_command("hello")  # уже запущен — пусть покажет себя
+            sys.exit(0)
+        write_pid("overlay")
+        set_dpi_aware()
+
+        self.cfg = load_config()
+        self.cfg_mtime = mtime(CONFIG_PATH)
+        self.state = load_state()
+        self.state_mtime = mtime(STATE_PATH)
+
+        self.q = queue.Queue()
+        self.runner = ClaudeRunner(self.q.put)
+        self.busy = False
+        self.capturing = False  # идёт снимок / выделение области
+        self.rid = None
+        self.cur_text = ""
+        self.chat_id = None
+        self.session_id = None
+        self.shown = ""
+        self._render_job = None
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.title("Claude Overlay — оверлей")
+        self.panel = Overlay(self.root, self.cfg, self.state, self._moved)
+
+        self.hotkeys = None
+        self.paused = hotkeys_paused()
+        if not self.paused:
+            self.start_hotkeys()
+        self._startup_check()
+        self.root.after(30, self._poll_queue)
+        self.root.after(400, self._poll_files)
+
+    # --- горячие клавиши ---------------------------------------------------
+    def start_hotkeys(self):
+        self.stop_hotkeys()
+        hk = self.cfg["hotkeys"]
+        self.hotkeys = WinHotkeys(hk, self.q.put) if IS_WIN else PynputHotkeys(hk, self.q.put)
+        self.hotkeys.start()
+
+    def stop_hotkeys(self):
+        if self.hotkeys:
+            try:
+                self.hotkeys.stop()
+            except Exception:
+                pass
+            self.hotkeys = None
+
+    def _hk(self, action):
+        return pretty_combo(self.cfg["hotkeys"].get(action, ""))
+
+    def _hotkey(self, action):
+        if action == "shot":
+            self.shot(region=False)
+        elif action == "region":
+            self.shot(region=True)
+        elif action == "toggle":
+            self.panel.cancel_hide()
+            self.panel.toggle()
+        elif action == "scroll_up":
+            self.panel.scroll(-1)
+        elif action == "scroll_down":
+            self.panel.scroll(1)
+        elif action == "move":
+            self.panel.toggle_move()
+        elif action == "stop":
+            if self.busy:
+                self.runner.stop()
+        elif action == "chat":
+            self.open_manager()
+        elif action == "quit":
+            self.quit()
+
+    def open_manager(self):
+        if running_pid("manager"):
+            send_command("focus", "manager")
+            focus_window(MANAGER_TITLE)
+        else:
+            launch("manager.py")
+
+    # --- запуск: проверка Claude Code и входа ------------------------------
+    def _startup_check(self):
+        path = self.cfg.get("claude_path", "")
+
+        def check():
+            exe = find_claude(path)
+            if not exe:
+                self.q.put(("auth", None, "", False, ""))
+            else:
+                self.q.put(("auth", exe, claude_version(exe)) + auth_status(exe))
+        threading.Thread(target=check, daemon=True).start()
+
+    def _on_auth(self, exe, logged):
+        how = f"Открой «Управление» ({self._hk('chat')}) → ⚙ Настройки → Аккаунт."
+        if not exe:
+            self.panel.flash("⚠ Claude Code не найден. " + how, 15)
+        elif not logged:
+            self.panel.flash("⚠ Не выполнен вход в аккаунт Claude. " + how, 15)
+        else:
+            chat = get_active_chat()
+            hint = " · ".join(f"{self._hk(a)} — {t}" for a, t in (
+                ("shot", "скриншот"), ("region", "область"), ("toggle", "скрыть панель"))
+                if self.cfg["hotkeys"].get(a))
+            paused = "\n(горячие клавиши на паузе, пока открыты настройки)" if self.paused else ""
+            self.panel.flash(f"Оверлей запущен · чат «{chat.get('title')}»\n{hint}{paused}", 6)
+
+    # --- скриншот → Claude ---------------------------------------------------
+    def shot(self, region):
+        if self.capturing:
+            return
+        if self.busy:
+            self.panel.show()
+            self.panel.set_status(f"ещё отвечаю… ({self._hk('stop')} — стоп)")
+            return
+        chat = get_active_chat()
+        who = acquire_chat(chat["id"], "overlay")
+        if who:
+            self.panel.flash(f"Чат «{chat.get('title')}» сейчас занят ({WHO_NAMES.get(who, who)}). "
+                             "Дождись ответа.", 5)
+            return
+        prompt = (chat.get("screenshot_prompt") or "").strip() or self.cfg["screenshot_prompt"]
+        self.capturing = True
+        was_visible = self.panel.visible
+        self.panel.hide()
+        px, py = self.root.winfo_pointerxy()
+
+        def cancel():
+            self.capturing = False
+            release_chat(chat["id"])
+            if was_visible:
+                self.panel.show()
+
+        def send(img):
+            self.capturing = False
+            content = [{"type": "text", "text": prompt},
+                       image_to_block(img, self.cfg["max_image_side"])]
+            self.start_request(chat, content, "📷 скриншот" + (" области" if region else ""))
+
+        def grab():
+            try:
+                img, mon = grab_screen_at(px, py)
+            except Exception as e:
+                cancel()
+                self.panel.flash(f"Не удалось сделать скриншот: {e}")
+                return
+            if region:
+                RegionSelector(self.root, img, mon, send, cancel)
+            else:
+                send(img)
+        self.root.after(200, grab)
+
+    def start_request(self, chat, content, shown):
+        exe = find_claude(self.cfg.get("claude_path", ""))
+        if not exe:
+            release_chat(chat["id"])
+            self.panel.flash("⚠ Claude Code не найден. Открой «Управление» → ⚙ Настройки → Аккаунт.")
+            return
+        fresh = load_chat(chat["id"]) or chat  # session_id мог обновиться в «Управлении»
+        self.busy = True
+        self.chat_id = chat["id"]
+        self.session_id = None
+        self.shown = shown
+        self.cur_text = ""
+        self.panel.cancel_hide()
+        self.panel.show()
+        self.panel.set_text("")
+        self.panel.set_status(f"думаю… · {chat.get('title')}")
+        self.rid = self.runner.start(exe, content, fresh.get("session_id"), self.cfg.get("model"))
+
+    # --- события ---------------------------------------------------------------
+    def _poll_queue(self):
+        try:
+            while True:
+                self._handle(self.q.get_nowait())
+        except queue.Empty:
+            pass
+        self.root.after(30, self._poll_queue)
+
+    def _handle(self, ev):
+        kind = ev[0]
+        if kind == "hotkey":
+            self._hotkey(ev[1])
+            return
+        if kind == "hotkey_fail":
+            self.panel.flash("Не удалось назначить горячие клавиши: " + "; ".join(ev[1]) +
+                             ". Поменяй их в «Управлении» → ⚙ Настройки.", 12)
+            return
+        if kind == "auth":
+            self._on_auth(ev[1], ev[3])
+            return
+        if ev[1] != self.rid:
+            return
+        if kind == "session":
+            self.session_id = ev[2]
+        elif kind == "status":
+            self.panel.set_status(ev[2])
+        elif kind == "msg_start":
+            if self.cur_text and not self.cur_text.endswith("\n\n"):
+                self.cur_text += "\n\n"
+        elif kind == "delta":
+            self.cur_text += ev[2]
+            if not self._render_job:
+                self._render_job = self.root.after(50, self._render)
+        elif kind == "done":
+            text, sid, is_err = ev[2], ev[3], ev[4]
+            clear = False
+            if is_err and not text.startswith("⏹"):
+                text, clear = resolve_error(text)
+            self._finish(text or self.cur_text, sid or self.session_id, clear)
+        elif kind == "fail":
+            text, clear = resolve_error(ev[2])
+            self._finish(text, None, clear)
+
+    def _render(self):
+        self._render_job = None
+        if self.busy:
+            self.panel.set_text(self.cur_text, scroll_end=True)
+            self.panel.set_status("пишу…")
+
+    def _finish(self, text, sid, clear_session):
+        if self._render_job:
+            self.root.after_cancel(self._render_job)
+            self._render_job = None
+        self.busy = False
+        self.panel.set_text(text)
+        self.panel.set_status("")
+        self.panel.schedule_hide()
+        try:
+            append_messages(self.chat_id, [{"role": "you", "text": self.shown},
+                                           {"role": "claude", "text": text}],
+                            session_id=sid, clear_session=clear_session)
+        finally:
+            release_chat(self.chat_id)
+
+    # --- связь с «Управлением» через файлы ------------------------------------
+    def _poll_files(self):
+        try:
+            for cmd in take_commands("overlay"):
+                if cmd in ("stop", "quit"):
+                    self.quit()
+                    return
+                if cmd == "hello":
+                    self.panel.flash("Оверлей уже запущен.", 3)
+                elif cmd in dict(ACTION_NAMES):
+                    self._hotkey(cmd)
+            m = mtime(CONFIG_PATH)
+            if m != self.cfg_mtime:
+                self.cfg_mtime = m
+                old_hk = dict(self.cfg["hotkeys"])
+                self.cfg = load_config()
+                self.panel.apply_config(self.cfg)
+                if self.cfg["hotkeys"] != old_hk and not self.paused:
+                    self.start_hotkeys()
+            m = mtime(STATE_PATH)
+            if m != self.state_mtime:
+                self.state_mtime = m
+                st = load_state()
+                if st.get("overlay_pos") != self.state.get("overlay_pos") and not self.panel.move_mode:
+                    self.state["overlay_pos"] = st.get("overlay_pos")
+                    self.panel._schedule_fit()
+            p = hotkeys_paused()
+            if p and not self.paused:
+                self.paused = True
+                self.stop_hotkeys()
+            elif not p and self.paused:
+                self.paused = False
+                self.start_hotkeys()
+        finally:
+            self.root.after(400, self._poll_files)
+
+    def _moved(self):
+        update_state(overlay_pos=self.state.get("overlay_pos"))
+        self.state_mtime = mtime(STATE_PATH)
+
+    def quit(self):
+        try:
+            self.runner.stop()
+            self.stop_hotkeys()
+            if self.busy and self.chat_id:
+                release_chat(self.chat_id)
+        finally:
+            clear_pid("overlay")
+            self.root.destroy()
+
+    def run(self):
+        try:
+            self.root.mainloop()
+        finally:
+            clear_pid("overlay")
+
+
+if __name__ == "__main__":
+    OverlayApp().run()

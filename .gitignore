@@ -1,7 +1,10 @@
 # создаётся программой при запуске
 config.json
+data/
 state.json
+state.old.json
 *.tmp
+*.lock
 workspace/
 __pycache__/
 *.pyc

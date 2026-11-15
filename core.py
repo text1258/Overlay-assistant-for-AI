@@ -1,0 +1,1243 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Общее ядро «Claude поверх экрана»: настройки, работа с Claude Code (по подписке),
+горячие клавиши, панель-оверлей, хранилище чатов и связь между двумя программами:
+
+• manager.py — «Управление»: чаты, загрузка контекста, файлы, настройки;
+• overlay.py — оверлей: горячие клавиши, скриншоты, ответ в панели поверх экрана.
+"""
+import base64
+import ctypes
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import zipfile
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import messagebox
+
+import mss
+from PIL import Image, ImageEnhance, ImageTk
+
+IS_WIN = sys.platform == "win32"
+APP_DIR = Path(__file__).resolve().parent
+WORK = APP_DIR / "workspace"
+FILES = WORK / "files"
+CONFIG_PATH = APP_DIR / "config.json"
+DATA = APP_DIR / "data"
+CHATS = DATA / "chats"
+RUNTIME = DATA / "runtime"
+STATE_PATH = DATA / "state.json"
+OLD_STATE = APP_DIR / "state.json"  # от первой версии — переносится автоматически
+
+# ----------------------------------------------------------------------------
+# Настройки
+# ----------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "claude_path": "",          # пусто = искать `claude` автоматически
+    "model": "",                # "", "sonnet", "opus", "haiku", "fable"
+    "screenshot_prompt": (
+        "Это скриншот моего экрана. Помоги с тем, что на нём, "
+        "учитывая всё, о чём мы договорились раньше."
+    ),
+    "max_image_side": 1600,     # px, длинная сторона скриншота
+    "overlay": {
+        "width": 460,
+        "max_height": 420,
+        "opacity": 0.85,
+        "font_size": 11,
+        "corner": "top-right",  # top-right / top-left / bottom-right / bottom-left
+        "margin": 24,
+        "auto_hide_seconds": 0,  # 0 = не прятать автоматически
+    },
+    "hotkeys": {
+        "shot": "ctrl+alt+s",          # скрин всего экрана → Claude
+        "region": "ctrl+alt+a",        # выделить область → Claude
+        "toggle": "ctrl+alt+h",        # скрыть / показать панель
+        "scroll_up": "ctrl+alt+pageup",
+        "scroll_down": "ctrl+alt+pagedown",
+        "move": "ctrl+alt+m",          # режим перемещения панели
+        "chat": "ctrl+alt+c",          # открыть «Управление»
+        "stop": "ctrl+alt+x",          # остановить ответ
+        "quit": "ctrl+alt+q",          # закрыть оверлей
+    },
+}
+
+DEFAULT_CLAUDE_MD = """# Экранный помощник
+
+Ты работаешь как помощник поверх экрана. Пользователь заранее обсуждает с тобой
+задачу и присылает файлы в окне «Управление», а потом присылает скриншоты своего
+экрана по горячей клавише. Ответ показывается в небольшой
+полупрозрачной панели в углу экрана, поэтому:
+
+- Отвечай по-русски, коротко и по делу: сначала сам ответ, потом, если нужно, пояснение.
+- Не используй Markdown-таблицы и заголовки; простые списки можно.
+- Формулы пиши простым Unicode-текстом (x², √x, ∫, ≤, π, →), не LaTeX — панель его не рисует.
+- Если на скриншоте несколько вопросов или задач — ответь на каждый, пронумеровав.
+- Учитывай всё, что обсуждалось в этом диалоге раньше: договорённости, присланные файлы.
+- Прикреплённые файлы лежат в папке files/ — читай их инструментом Read.
+
+(Этот файл можно редактировать. Изменения действуют с нового диалога.)
+"""
+
+
+def deep_merge(base, extra):
+    out = dict(base)
+    for k, v in (extra or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# ----------------------------------------------------------------------------
+# Вспомогательное
+# ----------------------------------------------------------------------------
+def clean_md(s: str) -> str:
+    """Лёгкая чистка Markdown для показа в простом окне."""
+    s = re.sub(r"^\s*```.*$\n?", "", s, flags=re.M)
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s, flags=re.S)
+    s = re.sub(r"__(.+?)__", r"\1", s, flags=re.S)
+    s = re.sub(r"^#{1,6}\s*", "", s, flags=re.M)
+    s = re.sub(r"`([^`\n]+)`", r"\1", s)
+    s = re.sub(r"^(\s*)[-*]\s+", r"\1• ", s, flags=re.M)
+    return s.strip("\n")
+
+
+def image_to_block(img: Image.Image, max_side: int) -> dict:
+    img = img.convert("RGB")
+    img.thumbnail((max_side, max_side), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    data, mt = buf.getvalue(), "image/png"
+    if len(data) > 3_500_000:  # лимит API на картинку ~5 МБ
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=88)
+        data, mt = buf.getvalue(), "image/jpeg"
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": mt,
+                   "data": base64.b64encode(data).decode("ascii")},
+    }
+
+
+def docx_to_text(path: Path) -> str:
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(path) as z:
+        root = ET.fromstring(z.read("word/document.xml"))
+    paras = []
+    for p in root.iter(ns + "p"):
+        parts = []
+        for node in p.iter():
+            if node.tag == ns + "t":
+                parts.append(node.text or "")
+            elif node.tag == ns + "tab":
+                parts.append("\t")
+            elif node.tag in (ns + "br", ns + "cr"):
+                parts.append("\n")
+        paras.append("".join(parts))
+    return "\n".join(paras)
+
+
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+def copy_unique(src: Path, folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / src.name
+    i = 2
+    while dest.exists():
+        dest = folder / f"{src.stem}_{i}{src.suffix}"
+        i += 1
+    shutil.copy2(src, dest)
+    return dest
+
+
+def grab_screen_at(x, y):
+    """Скриншот монитора, на котором сейчас курсор."""
+    with mss.mss() as sct:
+        mons = sct.monitors[1:] or [sct.monitors[0]]
+        mon = next((m for m in mons
+                    if m["left"] <= x < m["left"] + m["width"]
+                    and m["top"] <= y < m["top"] + m["height"]), mons[0])
+        shot = sct.grab(mon)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    return img, dict(mon)
+
+
+# ----------------------------------------------------------------------------
+# Глобальные горячие клавиши
+# ----------------------------------------------------------------------------
+_VK = {"pageup": 0x21, "pagedown": 0x22, "end": 0x23, "home": 0x24,
+       "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+       "space": 0x20, "enter": 0x0D, "tab": 0x09, "esc": 0x1B,
+       "insert": 0x2D, "delete": 0x2E, "`": 0xC0, "-": 0xBD, "=": 0xBB,
+       "[": 0xDB, "]": 0xDD, ";": 0xBA, "'": 0xDE, ",": 0xBC, ".": 0xBE, "/": 0xBF}
+_MODS = {"ctrl": 0x2, "control": 0x2, "alt": 0x1, "shift": 0x4, "win": 0x8}
+
+
+def parse_combo_win(combo: str):
+    mods, vk = 0, None
+    for part in combo.lower().replace(" ", "").split("+"):
+        if part in _MODS:
+            mods |= _MODS[part]
+        elif part in _VK:
+            vk = _VK[part]
+        elif re.fullmatch(r"f([1-9]|1[0-9]|2[0-4])", part):
+            vk = 0x70 + int(part[1:]) - 1
+        elif len(part) == 1 and part.isalnum():
+            vk = ord(part.upper())  # по физической клавише — работает и в русской раскладке
+        else:
+            raise ValueError(f"не понимаю клавишу «{part}» в «{combo}»")
+    if vk is None:
+        raise ValueError(f"нет основной клавиши в «{combo}»")
+    return mods, vk
+
+
+class WinHotkeys(threading.Thread):
+    """RegisterHotKey: не зависит от раскладки, не требует прав администратора."""
+
+    def __init__(self, bindings, post):
+        super().__init__(daemon=True)
+        self.bindings, self.post, self.tid = bindings, post, None
+
+    def run(self):
+        from ctypes import wintypes
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        self.tid = kernel32.GetCurrentThreadId()
+        ids, failed = {}, []
+        for i, (action, combo) in enumerate(self.bindings.items(), start=1):
+            if not combo:
+                continue  # сочетание отключено
+            try:
+                mods, vk = parse_combo_win(combo)
+            except ValueError as e:
+                failed.append(str(e))
+                continue
+            if user32.RegisterHotKey(None, i, mods | 0x4000, vk):  # 0x4000 = MOD_NOREPEAT
+                ids[i] = action
+            else:
+                failed.append(f"{combo} (уже занято другой программой)")
+        if failed:
+            self.post(("hotkey_fail", failed))
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == 0x0312 and msg.wParam in ids:  # WM_HOTKEY
+                self.post(("hotkey", ids[msg.wParam]))
+        for i in ids:
+            user32.UnregisterHotKey(None, i)
+
+    def stop(self):
+        for _ in range(50):  # поток мог ещё не успеть стартовать
+            if self.tid or not self.is_alive():
+                break
+            time.sleep(0.01)
+        if self.tid:
+            ctypes.windll.user32.PostThreadMessageW(self.tid, 0x0012, 0, 0)  # WM_QUIT
+        self.join(1.5)  # дождаться UnregisterHotKey, иначе новые клавиши будут «заняты»
+
+
+class PynputHotkeys:
+    """Запасной вариант для macOS / Linux."""
+
+    def __init__(self, bindings, post):
+        self.listener = None
+        try:
+            from pynput import keyboard
+        except ImportError:
+            post(("hotkey_fail", ["модуль pynput не установлен"]))
+            return
+        names = {"ctrl": "<ctrl>", "control": "<ctrl>", "alt": "<alt>", "shift": "<shift>",
+                 "win": "<cmd>", "pageup": "<page_up>", "pagedown": "<page_down>",
+                 "space": "<space>", "enter": "<enter>", "esc": "<esc>", "up": "<up>",
+                 "down": "<down>", "left": "<left>", "right": "<right>"}
+        mapping = {}
+        for action, combo in bindings.items():
+            if not combo:
+                continue
+            parts = [names.get(p, f"<{p}>" if re.fullmatch(r"f\d+", p) else p)
+                     for p in combo.lower().replace(" ", "").split("+")]
+            mapping["+".join(parts)] = (lambda a=action: post(("hotkey", a)))
+        try:
+            self.listener = keyboard.GlobalHotKeys(mapping)
+            self.listener.start()
+        except Exception as e:
+            post(("hotkey_fail", [str(e)]))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        if self.listener:
+            self.listener.stop()
+
+
+ACTION_NAMES = [
+    ("shot", "Скриншот всего экрана → Claude"),
+    ("region", "Скриншот области → Claude"),
+    ("toggle", "Скрыть / показать панель"),
+    ("scroll_up", "Прокрутить ответ вверх"),
+    ("scroll_down", "Прокрутить ответ вниз"),
+    ("move", "Режим перемещения панели"),
+    ("chat", "Открыть «Управление»"),
+    ("stop", "Остановить ответ"),
+    ("quit", "Закрыть оверлей"),
+]
+
+_PRETTY = {"pageup": "PgUp", "pagedown": "PgDn", "ctrl": "Ctrl", "alt": "Alt",
+           "shift": "Shift", "win": "Win", "space": "Space", "enter": "Enter"}
+
+
+def pretty_combo(combo: str) -> str:
+    if not combo:
+        return "— выкл —"
+    return "+".join(_PRETTY.get(p, p.upper() if len(p) <= 3 else p.capitalize())
+                    for p in combo.lower().replace(" ", "").split("+"))
+
+
+_MOD_KEYSYMS = {"Control_L": "ctrl", "Control_R": "ctrl", "Alt_L": "alt", "Alt_R": "alt",
+                "Shift_L": "shift", "Shift_R": "shift", "Win_L": "win", "Win_R": "win",
+                "Super_L": "win", "Super_R": "win", "Meta_L": "alt", "Meta_R": "alt",
+                "ISO_Level3_Shift": "alt", "App": None, "Caps_Lock": None, "Num_Lock": None}
+_VK_NAMES = {v: k for k, v in _VK.items() if k != "esc"}
+_KEYSYM_NAMES = {"Prior": "pageup", "Next": "pagedown", "Up": "up", "Down": "down",
+                 "Left": "left", "Right": "right", "space": "space", "Return": "enter",
+                 "Tab": "tab", "Home": "home", "End": "end", "Insert": "insert",
+                 "Delete": "delete", "grave": "`", "minus": "-", "equal": "=",
+                 "bracketleft": "[", "bracketright": "]", "semicolon": ";",
+                 "apostrophe": "'", "comma": ",", "period": ".", "slash": "/"}
+
+
+def key_name_from_event(e):
+    """Имя основной клавиши по физической кнопке (не зависит от раскладки на Windows)."""
+    if IS_WIN:
+        vk = e.keycode
+        if 0x41 <= vk <= 0x5A or 0x30 <= vk <= 0x39:
+            return chr(vk).lower()
+        if 0x70 <= vk <= 0x87:
+            return f"f{vk - 0x6F}"
+        return _VK_NAMES.get(vk)
+    ks = e.keysym
+    if ks in _KEYSYM_NAMES:
+        return _KEYSYM_NAMES[ks]
+    if re.fullmatch(r"F\d+", ks):
+        return ks.lower()
+    if len(ks) == 1 and ks.isascii() and ks.isalnum():
+        return ks.lower()
+    return None
+
+
+def mods_from_state(state: int) -> set:
+    mods = set()
+    if state & 0x4:
+        mods.add("ctrl")
+    if state & 0x1:
+        mods.add("shift")
+    if (IS_WIN and state & 0x20000) or (not IS_WIN and state & 0x8):
+        mods.add("alt")
+    return mods
+
+
+# ----------------------------------------------------------------------------
+# Запуск Claude Code (по подписке)
+# ----------------------------------------------------------------------------
+NO_WINDOW = 0x08000000 if IS_WIN else 0
+
+
+def claude_env():
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)  # чтобы точно шла подписка, а не API
+    return env
+
+
+def _find_value(obj, keys):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in keys and isinstance(v, (str, int)) and str(v):
+                return str(v)
+        for v in obj.values():
+            r = _find_value(v, keys)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_value(v, keys)
+            if r:
+                return r
+    return None
+
+
+def claude_version(exe):
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True, timeout=30,
+                           env=claude_env(), creationflags=NO_WINDOW)
+        return r.stdout.decode("utf-8", "replace").strip()[:40]
+    except Exception:
+        return ""
+
+
+def auth_status(exe):
+    """(вошёл ли, описание) — через `claude auth status`."""
+    try:
+        r = subprocess.run([exe, "auth", "status"], capture_output=True, timeout=40,
+                           env=claude_env(), creationflags=NO_WINDOW)
+    except Exception as e:
+        return False, f"Не удалось проверить вход: {e}"
+    out = r.stdout.decode("utf-8", "replace").strip()
+    try:
+        j = json.loads(out)
+    except ValueError:
+        j = None
+    j = j if isinstance(j, dict) else {}
+    method = j.get("authMethod")
+    logged = r.returncode == 0 and method != "none" and j.get("loggedIn", True) is not False
+    if not logged:
+        return False, "Вход не выполнен."
+    email = _find_value(j, {"email", "emailAddress", "accountEmail"})
+    plan = _find_value(j, {"subscriptionType", "subscription", "plan"})
+    parts = ["✔ Вход выполнен"]
+    if email:
+        parts.append(email)
+    if plan:
+        parts.append(f"подписка: {plan}")
+    desc = " · ".join(parts)
+    if method in ("api_key", "api_key_helper"):
+        desc += ("\n⚠ Сейчас используется API-ключ, а не подписка. Нажми «Выйти» "
+                 "и войди заново аккаунтом claude.ai.")
+    elif method and method != "claude.ai":
+        desc += f"\n(способ входа: {method})"
+    return True, desc
+
+
+def open_in_terminal(args):
+    """Запустить команду в отдельном окне терминала (нужно для входа и установки)."""
+    if IS_WIN:
+        return subprocess.Popen(args, env=claude_env(), creationflags=subprocess.CREATE_NEW_CONSOLE)
+    cmd = " ".join(shlex.quote(a) for a in args)
+    if sys.platform == "darwin":
+        script = cmd.replace("\\", "\\\\").replace('"', '\\"')
+        return subprocess.Popen(["osascript", "-e", f'tell application "Terminal" to do script "{script}"',
+                                 "-e", 'tell application "Terminal" to activate'])
+    for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"],
+                 ["konsole", "-e"], ["xterm", "-e"]):
+        if shutil.which(term[0]):
+            return subprocess.Popen(term + ["bash", "-c", cmd + "; read -p 'Enter — закрыть '"],
+                                    env=claude_env())
+    return subprocess.Popen(args, env=claude_env())
+
+
+def install_command():
+    if IS_WIN:
+        return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit",
+                "-Command", "irm https://claude.ai/install.ps1 | iex"]
+    return ["bash", "-c", "curl -fsSL https://claude.ai/install.sh | bash"]
+
+
+def find_claude(cfg_path: str):
+    if cfg_path and Path(cfg_path).exists():
+        return cfg_path
+    p = shutil.which("claude")
+    if p:
+        return p
+    home = Path.home()
+    for cand in (home / ".local" / "bin" / ("claude.exe" if IS_WIN else "claude"),
+                 home / ".claude" / "local" / ("claude.exe" if IS_WIN else "claude"),
+                 Path(os.environ.get("APPDATA", "")) / "npm" / "claude.cmd"):
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+class ClaudeRunner:
+    def __init__(self, post):
+        self.post = post
+        self.proc = None
+        self.req_id = 0
+        self.cancelled = False
+
+    def start(self, exe, blocks, session_id, model):
+        self.req_id += 1
+        self.cancelled = False
+        rid = self.req_id
+        threading.Thread(target=self._run, args=(rid, exe, blocks, session_id, model),
+                         daemon=True).start()
+        return rid
+
+    def stop(self):
+        self.cancelled = True
+        p = self.proc
+        if p and p.poll() is None:
+            try:
+                if IS_WIN:
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)],
+                                   capture_output=True, creationflags=0x08000000)
+                else:
+                    p.terminate()
+            except Exception:
+                pass
+
+    def _run(self, rid, exe, blocks, session_id, model):
+        post = lambda *ev: self.post((ev[0], rid) + ev[1:])
+        args = [exe, "-p",
+                "--input-format", "stream-json",
+                "--output-format", "stream-json", "--verbose",
+                "--include-partial-messages"]
+        if session_id:
+            args += ["--resume", session_id]
+        if model:
+            args += ["--model", model]
+        # Только чтение файлов: никаких команд, правок и интернета
+        args += ["--tools", "Read", "--allowedTools", "Read", "--disallowedTools", "mcp__*"]
+
+        env = claude_env()
+        msg = {"type": "user", "message": {"role": "user", "content": blocks},
+               "parent_tool_use_id": None}
+        payload = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
+
+        try:
+            self.proc = proc = subprocess.Popen(
+                args, cwd=str(WORK), env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=0x08000000 if IS_WIN else 0)
+        except Exception as e:
+            post("fail", f"Не удалось запустить Claude Code: {e}")
+            return
+
+        def feed():
+            try:
+                proc.stdin.write(payload)
+                proc.stdin.close()
+            except Exception:
+                pass
+
+        err_chunks = []
+        threading.Thread(target=feed, daemon=True).start()
+        threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()), daemon=True).start()
+
+        result = None
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            t = ev.get("type")
+            if t == "system" and ev.get("subtype") == "init" and ev.get("session_id"):
+                post("session", ev["session_id"])
+            elif t == "stream_event":
+                e = ev.get("event") or {}
+                et = e.get("type")
+                if et == "message_start":
+                    post("msg_start")
+                elif et == "content_block_start":
+                    cb = e.get("content_block") or {}
+                    if cb.get("type") == "tool_use":
+                        post("status", "читаю файл…" if cb.get("name") == "Read"
+                             else f"инструмент {cb.get('name')}…")
+                    elif cb.get("type") == "thinking":
+                        post("status", "думаю…")
+                elif et == "content_block_delta":
+                    d = e.get("delta") or {}
+                    if d.get("type") == "text_delta":
+                        post("delta", d.get("text", ""))
+            elif t == "system" and ev.get("subtype") == "api_retry":
+                post("status", f"повтор запроса ({ev.get('error', '')})…")
+            elif t == "result":
+                result = ev
+        proc.wait()
+        time.sleep(0.05)
+        stderr = b"".join(c for c in err_chunks if c).decode("utf-8", "replace").strip()
+
+        if self.cancelled:
+            post("done", "⏹ Остановлено.", None, True)
+        elif result is None:
+            post("fail", stderr or f"Claude Code завершился без ответа (код {proc.returncode}).")
+        else:
+            text = result.get("result")
+            if not text and result.get("errors"):
+                text = "\n".join(map(str, result["errors"]))
+            post("done", text or "", result.get("session_id"), bool(result.get("is_error")))
+
+
+# ----------------------------------------------------------------------------
+# Панель поверх экрана
+# ----------------------------------------------------------------------------
+class Overlay:
+    BG, FG, DIM, ACCENT = "#16181d", "#ececec", "#8b8f98", "#d97757"
+
+    def __init__(self, root, cfg, state, on_moved):
+        self.root, self.state, self.on_moved = root, state, on_moved
+        self.full, self.cfg = cfg, cfg["overlay"]
+        self.visible = False
+        self.move_mode = False
+        self._hide_job = None
+        self._fit_job = None
+
+        fam = "Segoe UI" if IS_WIN else "Helvetica"
+        self.font = tkfont.Font(family=fam, size=self.cfg["font_size"])
+        self.small = tkfont.Font(family=fam, size=max(8, self.cfg["font_size"] - 2))
+
+        w = self.win = tk.Toplevel(root)
+        w.withdraw()
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        w.attributes("-alpha", self.cfg["opacity"])
+        w.configure(bg=self.BG)
+
+        self.border = tk.Frame(w, bg=self.BG, padx=2, pady=2)
+        self.border.pack(fill="both", expand=True)
+        inner = tk.Frame(self.border, bg=self.BG)
+        inner.pack(fill="both", expand=True)
+
+        head = tk.Frame(inner, bg=self.BG)
+        head.pack(fill="x", padx=10, pady=(6, 0))
+        self.status = tk.Label(head, text="Claude", fg=self.ACCENT, bg=self.BG,
+                               font=self.small, anchor="w")
+        self.status.pack(side="left")
+        self.hint = tk.Label(head, text="", fg=self.DIM, bg=self.BG, font=self.small, anchor="e")
+        self.hint.pack(side="right")
+        self.head = head
+
+        self.text = tk.Text(inner, wrap="word", bg=self.BG, fg=self.FG, bd=0,
+                            highlightthickness=0, padx=10, pady=6, font=self.font,
+                            cursor="arrow", insertwidth=0)
+        self.text.pack(fill="both", expand=True)
+        self.text.configure(state="disabled")
+
+        for wd in (head, self.status, self.hint, self.text):
+            wd.bind("<ButtonPress-1>", self._drag_start)
+            wd.bind("<B1-Motion>", self._drag_move)
+            wd.bind("<ButtonRelease-1>", self._drag_end)
+        self._keep_on_top()
+
+    def apply_config(self, cfg):
+        self.full, self.cfg = cfg, cfg["overlay"]
+        self.font.configure(size=self.cfg["font_size"])
+        self.small.configure(size=max(8, self.cfg["font_size"] - 2))
+        self.win.attributes("-alpha", self.cfg["opacity"])
+        self._schedule_fit()
+
+    # --- видимость -------------------------------------------------------
+    def show(self):
+        if not self.visible:
+            self.win.deiconify()
+            self.visible = True
+            self.win.update_idletasks()
+            self._apply_click_through()
+        self._fit()
+
+    def hide(self):
+        if self.visible:
+            self.win.withdraw()
+            self.visible = False
+
+    def toggle(self):
+        self.hide() if self.visible else self.show()
+
+    def _keep_on_top(self):
+        if self.visible:
+            try:
+                self.win.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+        self.root.after(3000, self._keep_on_top)
+
+    def _apply_click_through(self):
+        if not IS_WIN:
+            return
+        try:
+            u = ctypes.windll.user32
+            hwnd = u.GetParent(self.win.winfo_id()) or self.win.winfo_id()
+            style = u.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+            style |= 0x80000 | 0x80 | 0x08000000  # LAYERED | TOOLWINDOW | NOACTIVATE
+            if self.move_mode:
+                style &= ~0x20
+            else:
+                style |= 0x20  # TRANSPARENT: клики проходят насквозь
+            u.SetWindowLongW(hwnd, -20, style)
+        except Exception:
+            pass
+
+    # --- содержимое ------------------------------------------------------
+    def set_status(self, s):
+        self.status.configure(text=f"Claude · {s}" if s else "Claude")
+
+    def set_text(self, s, scroll_end=False):
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", clean_md(s))
+        self.text.configure(state="disabled")
+        if scroll_end:
+            self.text.see("end")
+        else:
+            self.text.yview_moveto(0)
+        self._schedule_fit()
+
+    def scroll(self, direction):
+        self.text.yview_scroll(direction * 3, "units")
+
+    def schedule_hide(self):
+        if self._hide_job:
+            self.root.after_cancel(self._hide_job)
+            self._hide_job = None
+        sec = self.cfg.get("auto_hide_seconds") or 0
+        if sec > 0:
+            self._hide_job = self.root.after(int(sec * 1000), self.hide)
+
+    def hide_after(self, seconds):
+        self.cancel_hide()
+        self._hide_job = self.root.after(int(seconds * 1000), self.hide)
+
+    def flash(self, text, seconds=6):
+        """Короткое служебное сообщение в панели."""
+        self.show()
+        self.set_status("")
+        self.set_text(text)
+        self.hide_after(seconds)
+
+    def cancel_hide(self):
+        if self._hide_job:
+            self.root.after_cancel(self._hide_job)
+            self._hide_job = None
+
+    # --- размер и положение ---------------------------------------------
+    def _schedule_fit(self):
+        if not self._fit_job:
+            self._fit_job = self.root.after(30, self._fit)
+
+    def _fit(self):
+        self._fit_job = None
+        if not self.visible:
+            return
+        width, max_h = self.cfg["width"], self.cfg["max_height"]
+        head_h = self.head.winfo_reqheight() + 6
+        x, y = self._position(width, max_h)
+        self.win.geometry(f"{width}x{max_h}+{x}+{y}")
+        self.win.update_idletasks()
+        try:
+            r = self.text.count("1.0", "end-1c", "displaylines")
+            n = r[0] if isinstance(r, tuple) else (r or 0)
+        except Exception:
+            n = int(self.text.index("end-1c").split(".")[0])
+        has_text = bool(self.text.get("1.0", "end-1c").strip())
+        body = (n + 1) * self.font.metrics("linespace") + 14 if has_text else 4
+        h = max(head_h + 8, min(max_h, head_h + body + 4))
+        x, y = self._position(width, h)
+        self.win.geometry(f"{width}x{h}+{x}+{y}")
+        hk = self.full["hotkeys"]
+        scroll = f"{pretty_combo(hk.get('scroll_up'))} / {pretty_combo(hk.get('scroll_down'))} — прокрутка"
+        self.hint.configure(text=scroll if body + head_h > max_h else "")
+
+    def _position(self, w, h):
+        pos = self.state.get("overlay_pos")
+        if pos:
+            return int(pos[0]), int(pos[1])
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        m = self.cfg["margin"]
+        corner = self.cfg.get("corner", "top-right")
+        x = sw - w - m if "right" in corner else m
+        y = sh - h - m - 40 if "bottom" in corner else m
+        return x, y
+
+    # --- перемещение -----------------------------------------------------
+    def toggle_move(self):
+        self.move_mode = not self.move_mode
+        self.border.configure(bg=self.ACCENT if self.move_mode else self.BG)
+        if self.move_mode:
+            self.show()
+            self.set_status("перемещение: тащи мышью, колесо — прокрутка, "
+                            f"{pretty_combo(self.full['hotkeys'].get('move'))} — закрепить")
+        else:
+            self.set_status("")
+        self._apply_click_through()
+
+    def _drag_start(self, e):
+        if not self.move_mode:
+            return
+        self._dx = e.x_root - self.win.winfo_x()
+        self._dy = e.y_root - self.win.winfo_y()
+        return "break"
+
+    def _drag_move(self, e):
+        if not self.move_mode:
+            return
+        x, y = e.x_root - self._dx, e.y_root - self._dy
+        self.win.geometry(f"+{x}+{y}")
+        self.state["overlay_pos"] = [x, y]
+        return "break"
+
+    def _drag_end(self, e):
+        if self.move_mode:
+            self.on_moved()
+            return "break"
+
+
+# ----------------------------------------------------------------------------
+# Выделение области
+# ----------------------------------------------------------------------------
+class RegionSelector:
+    def __init__(self, root, img, mon, on_done, on_cancel):
+        self.img, self.on_done, self.on_cancel = img, on_done, on_cancel
+        t = self.top = tk.Toplevel(root)
+        t.overrideredirect(True)
+        t.attributes("-topmost", True)
+        t.geometry(f"{mon['width']}x{mon['height']}+{mon['left']}+{mon['top']}")
+        dark = ImageEnhance.Brightness(img).enhance(0.55)
+        self.photo = ImageTk.PhotoImage(dark)
+        self.bright = img
+        c = self.canvas = tk.Canvas(t, highlightthickness=0, cursor="crosshair",
+                                    width=mon["width"], height=mon["height"])
+        c.pack(fill="both", expand=True)
+        c.create_image(0, 0, image=self.photo, anchor="nw")
+        c.create_text(mon["width"] // 2, 30, fill="white", font=("Segoe UI", 14),
+                      text="Выдели область мышью · Esc — отмена")
+        self.rect = None
+        self.start = None
+        c.bind("<ButtonPress-1>", self._press)
+        c.bind("<B1-Motion>", self._drag)
+        c.bind("<ButtonRelease-1>", self._release)
+        t.bind("<Escape>", lambda e: self._close(None))
+        t.bind("<ButtonPress-3>", lambda e: self._close(None))
+        t.after(50, lambda: (t.focus_force(), t.grab_set()))
+
+    def _press(self, e):
+        self.start = (e.x, e.y)
+        if self.rect:
+            self.canvas.delete(self.rect)
+        self.rect = self.canvas.create_rectangle(e.x, e.y, e.x, e.y, outline="#d97757", width=2)
+
+    def _drag(self, e):
+        if self.start:
+            self.canvas.coords(self.rect, *self.start, e.x, e.y)
+
+    def _release(self, e):
+        if not self.start:
+            return
+        x0, y0 = self.start
+        x1, y1 = e.x, e.y
+        box = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+            self._close(None)
+            return
+        self._close(self.img.crop(box))
+
+    def _close(self, crop):
+        try:
+            self.top.grab_release()
+        except tk.TclError:
+            pass
+        self.top.destroy()
+        (self.on_done(crop) if crop is not None else self.on_cancel())
+
+
+CORNERS = [("top-right", "справа сверху"), ("top-left", "слева сверху"),
+           ("bottom-right", "справа снизу"), ("bottom-left", "слева снизу")]
+MODEL_LABEL_DEFAULT = "по умолчанию"
+MODELS = [MODEL_LABEL_DEFAULT, "sonnet", "opus", "haiku", "fable"]
+
+
+def open_path(path):
+    try:
+        if IS_WIN:
+            os.startfile(str(path))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не открыть {path}: {e}")
+
+
+# ----------------------------------------------------------------------------
+# Общие данные двух программ: чаты, состояние, блокировки, команды
+# ----------------------------------------------------------------------------
+MANAGER_TITLE = "Claude Overlay — управление"
+DEFAULT_TITLE = "Новый чат"
+
+
+def ensure_dirs():
+    for d in (WORK, FILES, DATA, CHATS, RUNTIME):
+        d.mkdir(parents=True, exist_ok=True)
+    md = WORK / "CLAUDE.md"
+    if not md.exists():
+        md.write_text(DEFAULT_CLAUDE_MD, encoding="utf-8")
+
+
+def load_config():
+    return deep_merge(DEFAULT_CONFIG, load_json(CONFIG_PATH, {}))
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def set_dpi_aware():
+    if IS_WIN:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
+class FileLock:
+    """Короткая межпроцессная блокировка на время чтения-изменения-записи файла."""
+
+    def __init__(self, path, timeout=3.0):
+        self.path, self.timeout, self.owned = str(path), timeout, False
+
+    def __enter__(self):
+        end = time.time() + self.timeout
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                self.owned = True
+                return self
+            except FileExistsError:
+                if time.time() - mtime(self.path) > 10:  # зависшая блокировка
+                    try:
+                        os.unlink(self.path)
+                    except OSError:
+                        pass
+                    continue
+                if time.time() > end:
+                    return self
+                time.sleep(0.02)
+
+    def __exit__(self, *exc):
+        if self.owned:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+
+def pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if IS_WIN:
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def write_pid(name):
+    (RUNTIME / f"{name}.pid").write_text(str(os.getpid()))
+
+
+def clear_pid(name):
+    p = RUNTIME / f"{name}.pid"
+    try:
+        if int(p.read_text()) == os.getpid():
+            p.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def running_pid(name):
+    """PID другой запущенной копии программы `name` или None."""
+    try:
+        pid = int((RUNTIME / f"{name}.pid").read_text())
+    except (OSError, ValueError):
+        return None
+    return pid if pid != os.getpid() and pid_alive(pid) else None
+
+
+def send_command(cmd, target="overlay"):
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    tmp = RUNTIME / f"cmd_{target}_{time.time_ns()}_{os.getpid()}.tmp"
+    tmp.write_text(cmd, encoding="utf-8")
+    os.replace(tmp, tmp.with_suffix(".cmd"))
+
+
+def take_commands(target):
+    out = []
+    for p in sorted(RUNTIME.glob(f"cmd_{target}_*.cmd")):
+        try:
+            out.append(p.read_text(encoding="utf-8").strip())
+            p.unlink()
+        except OSError:
+            pass
+    return out
+
+
+PAUSE_FLAG = RUNTIME / "hotkeys_paused"
+
+
+def set_hotkeys_paused(paused):
+    try:
+        if paused:
+            PAUSE_FLAG.write_text(str(os.getpid()))
+        else:
+            PAUSE_FLAG.unlink()
+    except OSError:
+        pass
+
+
+def hotkeys_paused():
+    try:
+        return pid_alive(int(PAUSE_FLAG.read_text()))
+    except (OSError, ValueError):
+        return False
+
+
+# --- состояние (активный чат, позиция панели) ---------------------------------
+def load_state():
+    st = load_json(STATE_PATH, {})
+    return st if isinstance(st, dict) else {}
+
+
+def update_state(**kw):
+    with FileLock(STATE_PATH.with_suffix(".lock")):
+        st = load_state()
+        st.update(kw)
+        save_json(STATE_PATH, st)
+        return st
+
+
+# --- чаты ----------------------------------------------------------------------
+def _chat_path(cid):
+    return CHATS / f"{cid}.json"
+
+
+def list_chats():
+    out = []
+    for p in CHATS.glob("*.json"):
+        c = load_json(p, None)
+        if isinstance(c, dict) and c.get("id"):
+            out.append(c)
+    out.sort(key=lambda c: c.get("updated", ""), reverse=True)
+    return out
+
+
+def chats_signature():
+    return tuple(sorted((p.name, mtime(p)) for p in CHATS.glob("*.json")))
+
+
+def load_chat(cid):
+    if not cid:
+        return None
+    c = load_json(_chat_path(cid), None)
+    return c if isinstance(c, dict) else None
+
+
+def create_chat(title=None):
+    cid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
+    c = {"id": cid, "title": title or DEFAULT_TITLE, "created": now_iso(), "updated": now_iso(),
+         "session_id": None, "screenshot_prompt": "", "history": []}
+    save_json(_chat_path(cid), c)
+    return c
+
+
+def update_chat(cid, fn):
+    with FileLock(CHATS / f"{cid}.lock"):
+        c = load_chat(cid)
+        if c is None:
+            return None
+        fn(c)
+        c["updated"] = now_iso()
+        c["history"] = c.get("history", [])[-400:]
+        save_json(_chat_path(cid), c)
+        return c
+
+
+def append_messages(cid, msgs, session_id=None, clear_session=False):
+    def fn(c):
+        c.setdefault("history", []).extend(msgs)
+        if clear_session:
+            c["session_id"] = None
+        elif session_id:
+            c["session_id"] = session_id
+        if c.get("title") == DEFAULT_TITLE:
+            for m in msgs:
+                t = (m.get("text") or "").strip()
+                if m.get("role") == "you" and t and t[0] not in "📷📎":
+                    c["title"] = t.splitlines()[0][:40]
+                    break
+    return update_chat(cid, fn)
+
+
+def delete_chat(cid):
+    try:
+        _chat_path(cid).unlink()
+    except OSError:
+        pass
+
+
+def set_active_chat(cid):
+    update_state(active_chat=cid)
+
+
+def get_active_chat():
+    c = load_chat(load_state().get("active_chat"))
+    if c:
+        return c
+    chats = list_chats()
+    c = chats[0] if chats else create_chat()
+    set_active_chat(c["id"])
+    return c
+
+
+# --- «занятость» чата: в один чат одновременно пишет только одна программа ----
+def _busy_path(cid):
+    return RUNTIME / f"busy_{cid}.json"
+
+
+def acquire_chat(cid, who):
+    """None — чат захвачен нами; иначе — кто сейчас его занимает."""
+    p = _busy_path(cid)
+    for _ in range(3):
+        try:
+            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, json.dumps({"pid": os.getpid(), "who": who}).encode())
+            os.close(fd)
+            return None
+        except FileExistsError:
+            info = load_json(p, {}) or {}
+            if info and not pid_alive(info.get("pid")):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+                continue
+            if not info:
+                time.sleep(0.05)
+                continue
+            return info.get("who", "?")
+    return "?"
+
+
+def release_chat(cid):
+    p = _busy_path(cid)
+    info = load_json(p, {}) or {}
+    if info.get("pid") == os.getpid():
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def chat_busy_by(cid):
+    info = load_json(_busy_path(cid), {}) or {}
+    return info.get("who") if info and pid_alive(info.get("pid")) else None
+
+
+WHO_NAMES = {"overlay": "оверлей", "manager": "«Управление»"}
+
+
+def migrate_old_state():
+    """Перенос единственного диалога из старой версии (state.json рядом с программой)."""
+    if not OLD_STATE.exists():
+        return
+    old = load_json(OLD_STATE, {}) or {}
+    if (old.get("history") or old.get("session_id")) and not list_chats():
+        c = create_chat("Чат 1")
+        c["history"] = old.get("history") or []
+        c["session_id"] = old.get("session_id")
+        save_json(_chat_path(c["id"]), c)
+        set_active_chat(c["id"])
+    if old.get("overlay_pos"):
+        update_state(overlay_pos=old["overlay_pos"])
+    try:
+        os.replace(OLD_STATE, OLD_STATE.with_name("state.old.json"))
+    except OSError:
+        pass
+
+
+# --- запуск и переключение между программами ----------------------------------
+def python_gui_exe():
+    exe = Path(sys.executable)
+    if IS_WIN:
+        w = exe.with_name("pythonw.exe")
+        if w.exists():
+            return str(w)
+    return str(exe)
+
+
+def launch(script):
+    kw = {"cwd": str(APP_DIR)}
+    if IS_WIN:
+        kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED | NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    return subprocess.Popen([python_gui_exe(), str(APP_DIR / script)], **kw)
+
+
+def focus_window(title):
+    if not IS_WIN:
+        return False
+    u = ctypes.windll.user32
+    h = u.FindWindowW(None, title)
+    if not h:
+        return False
+    u.ShowWindow(h, 9)  # SW_RESTORE
+    u.SetForegroundWindow(h)
+    return True
+
+
+def resolve_error(text):
+    """Понятное объяснение ошибки Claude Code + что сделать. (сообщение, сбросить_сессию)."""
+    t = (text or "").strip()
+    low = t.lower()
+    if "no conversation found" in low or ("session" in low and "not found" in low):
+        return "⚠ Старая сессия Claude не найдена — чат продолжится с чистого листа. Повтори запрос.", True
+    if any(k in low for k in ("login", "log in", "/login", "authenticat", "oauth", "invalid api key")):
+        return ("⚠ Не выполнен вход в аккаунт Claude. Открой «Управление» → ⚙ Настройки → "
+                "Аккаунт → «Войти в аккаунт Claude».\n\n" + t), False
+    if "limit" in low:
+        return "⚠ Похоже, исчерпан лимит подписки на текущее окно.\n\n" + t, False
+    return "⚠ " + (t or "Неизвестная ошибка"), False
